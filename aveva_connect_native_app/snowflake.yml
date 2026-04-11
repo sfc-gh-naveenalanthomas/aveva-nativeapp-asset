@@ -1,0 +1,26 @@
+definition_version: 1
+
+native_app:
+  name: aveva_connect_app
+
+  application:
+    name: AVEVA_CONNECT_APP
+
+  source_stage: app_src.stage
+
+  artifacts:
+    - src: manifest.yml
+      dest: ./
+    - src: setup.sql
+      dest: ./
+    - src: README.md
+      dest: ./
+    - src: streamlit/*
+      dest: streamlit/
+
+  package:
+    name: AVEVA_CONNECT_APP_PKG
+    role: ACCOUNTADMIN
+    warehouse: COMPUTE_WH
+    post_deploy:
+      - sql_script: prescript.sql

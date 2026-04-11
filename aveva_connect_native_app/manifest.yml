@@ -1,0 +1,24 @@
+manifest_version: 2
+
+version:
+  name: V1
+  label: "1.0.0"
+  comment: "AVEVA CONNECT - Production-Grade Industrial Data Analytics"
+
+artifacts:
+  setup_script: setup.sql
+  readme: README.md
+  default_streamlit: CORE.HOME
+  extension_code: true
+
+privileges:
+  - IMPORTED PRIVILEGES ON SNOWFLAKE DB:
+      description: "Access Cortex AI functions for analytics and semantic view generation"
+  - EXECUTE TASK:
+      description: "Execute background tasks"
+  - EXECUTE MANAGED TASK:
+      description: "Execute managed background tasks"
+
+restricted_features:
+  - external_data:
+      description: "Access AVEVA CONNECT PI data historian streams shared via CLD and Iceberg tables"
