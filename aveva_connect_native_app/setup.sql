@@ -380,26 +380,57 @@ def run(session):
                         "asset": asset_name, "signal": signal_name, "dtype": "NUMERIC"
                     })
             else:
-                # Classic PI stream format: one view per signal
-                stream_name = view_name.replace("_", " ")
-                parts = stream_name.split(".")
-                asset_name = ".".join(parts[:-1]) if len(parts) > 1 else stream_name
-                signal_name = parts[-1] if len(parts) > 1 else "VALUE"
+                # Check if this is wide-format (Timestamp + many signal columns, no Value/Field/Uom)
+                has_value_col = any(cr["name"] in ("VALUE", "Value") for cr in col_rows)
+                is_wide_format = "Timestamp" in col_names and not has_value_col and len(col_names) > 2
 
-                data_type = "NUMERIC"
-                for cr in col_rows:
-                    cn = cr["name"]
-                    ct = cr["type"].upper()
-                    if cn in ("VALUE", "Value"):
-                        if "VARCHAR" in ct or "STRING" in ct:
-                            data_type = "STRING"
-                        elif "INT" in ct:
-                            data_type = "INTEGER"
+                if is_wide_format:
+                    # Wide format: each non-Timestamp column is a separate signal
+                    table_base = view_name.split("_")[0] if "_" in view_name else view_name
+                    for cr in col_rows:
+                        cn = cr["name"]
+                        if cn == "Timestamp":
+                            continue
+                        ct = cr["type"].upper()
+                        # Parse signal name: "GE01_P_ACT (kW)" -> asset="GE01", signal="P_ACT (kW)"
+                        parts = cn.split(".", 1)
+                        if len(parts) > 1:
+                            asset_name = parts[0].strip()
+                            signal_name = parts[1].strip()
+                        elif "_" in cn:
+                            first_sep = cn.index("_")
+                            asset_name = cn[:first_sep].strip()
+                            signal_name = cn[first_sep+1:].strip()
+                        else:
+                            asset_name = table_base
+                            signal_name = cn
+                        data_type = "STRING" if ("VARCHAR" in ct or "STRING" in ct) else "NUMERIC"
+                        stream_records.append({
+                            "view": view_name, "stream": cn,
+                            "asset": asset_name, "signal": signal_name, "dtype": data_type,
+                            "format": "wide"
+                        })
+                else:
+                    # Classic PI stream format: one view per signal
+                    stream_name = view_name.replace("_", " ")
+                    parts = stream_name.split(".")
+                    asset_name = ".".join(parts[:-1]) if len(parts) > 1 else stream_name
+                    signal_name = parts[-1] if len(parts) > 1 else "VALUE"
 
-                stream_records.append({
-                    "view": view_name, "stream": stream_name,
-                    "asset": asset_name, "signal": signal_name, "dtype": data_type
-                })
+                    data_type = "NUMERIC"
+                    for cr in col_rows:
+                        cn = cr["name"]
+                        ct = cr["type"].upper()
+                        if cn in ("VALUE", "Value"):
+                            if "VARCHAR" in ct or "STRING" in ct:
+                                data_type = "STRING"
+                            elif "INT" in ct:
+                                data_type = "INTEGER"
+
+                    stream_records.append({
+                        "view": view_name, "stream": stream_name,
+                        "asset": asset_name, "signal": signal_name, "dtype": data_type
+                    })
 
         # Batch classify domains using AI with keyword fallback
         all_pairs = [(r["asset"], r["signal"]) for r in stream_records]
@@ -412,9 +443,11 @@ def run(session):
             safe_stream = rec["stream"].replace("'", "''")
             safe_asset = rec["asset"].replace("'", "''")
             safe_signal = rec["signal"].replace("'", "''")
+            # Wide-format streams store DATA_TYPE='WIDE' for unified view detection
+            stored_dtype = "WIDE" if rec.get("format") == "wide" else rec["dtype"]
             session.sql(
                 f"INSERT INTO CONFIG.STREAM_METADATA (STREAM_VIEW_NAME, STREAM_NAME, ASSET_PATH, ASSET_NAME, SIGNAL_NAME, DOMAIN_CATEGORY, DATA_TYPE) "
-                f"VALUES ('{safe_view}', '{safe_stream}', '{safe_asset}', '{safe_asset}', '{safe_signal}', '{domain}', '{rec['dtype']}')"
+                f"VALUES ('{safe_view}', '{safe_stream}', '{safe_asset}', '{safe_asset}', '{safe_signal}', '{domain}', '{stored_dtype}')"
             ).collect()
 
             if rec["asset"] not in assets:
@@ -525,6 +558,17 @@ def run(session):
                     f'NULL::VARCHAR AS DIGITAL_STATE_NAME, '
                     f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
                     f'FROM DATA_VIEWS."{quoted_vn}" WHERE "Field" = \'{safe_stream}\''
+                )
+            elif dtype == "WIDE":
+                # Wide-format: each stream_name is a column name in the view
+                safe_col = stream_name.replace('"', '""')
+                unions.append(
+                    f'SELECT "Timestamp" AS TS, "{safe_col}"::DOUBLE AS NUMERIC_VALUE, "{safe_col}"::VARCHAR AS STRING_VALUE, '
+                    f'NULL::BOOLEAN AS IS_QUESTIONABLE, NULL::BOOLEAN AS IS_SUBSTITUTED, '
+                    f'NULL::BOOLEAN AS IS_ANNOTATED, NULL::NUMBER AS SYSTEM_STATE_CODE, '
+                    f'NULL::VARCHAR AS DIGITAL_STATE_NAME, '
+                    f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
+                    f'FROM DATA_VIEWS."{quoted_vn}" WHERE "{safe_col}" IS NOT NULL'
                 )
             else:
                 # Classic PI stream format

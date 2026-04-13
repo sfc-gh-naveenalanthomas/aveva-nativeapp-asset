@@ -154,6 +154,8 @@ DECLARE
     v_result          VARCHAR DEFAULT '';
     v_err             VARCHAR;
     v_proxy_count     INTEGER DEFAULT 0;
+    v_table_count     INTEGER DEFAULT 0;
+    v_retry           INTEGER DEFAULT 0;
 BEGIN
 
     -- =========================================================================
@@ -346,12 +348,24 @@ BEGIN
     -- Discovers tables from CLD and creates secure proxy views in the app
     -- package. These views are granted to the share so the consumer app's
     -- setup.sql can discover them via SHOW VIEWS IN SCHEMA PROXY_VIEWS.
+    -- CLD tables take time to sync from Delta Sharing — wait up to 90s.
     BEGIN
         EXECUTE IMMEDIATE 'CREATE SCHEMA IF NOT EXISTS ' || :v_app_pkg || '.PROXY_VIEWS';
         EXECUTE IMMEDIATE 'GRANT USAGE ON SCHEMA ' || :v_app_pkg || '.PROXY_VIEWS TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
 
-        -- Discover tables from CLD and create proxy views
-        -- Note: CLD tables may take a moment to sync. SHOW TABLES discovers what's available.
+        -- Wait for CLD tables to sync (up to 90 seconds, polling every 10s)
+        v_table_count := 0;
+        v_retry := 0;
+        WHILE (:v_table_count = 0 AND :v_retry < 9) DO
+            EXECUTE IMMEDIATE 'SHOW TABLES IN DATABASE ' || :v_cld_db;
+            SELECT COUNT(*) INTO v_table_count FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+            IF (:v_table_count = 0) THEN
+                CALL SYSTEM$WAIT(10, 'SECONDS');
+                v_retry := v_retry + 1;
+            END IF;
+        END WHILE;
+
+        -- Create proxy views for discovered tables
         EXECUTE IMMEDIATE 'SHOW TABLES IN DATABASE ' || :v_cld_db;
         LET c1 CURSOR FOR
             SELECT "name" AS TABLE_NAME, "schema_name" AS TABLE_SCHEMA
@@ -369,7 +383,7 @@ BEGIN
         CLOSE c1;
 
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'SUCCESS', :v_proxy_count || ' proxy views created');
+            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'SUCCESS', :v_proxy_count || ' proxy views created (waited ' || :v_retry * 10 || 's for CLD sync)');
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
