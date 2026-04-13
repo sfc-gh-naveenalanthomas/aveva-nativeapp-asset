@@ -218,11 +218,16 @@ BEGIN
         EXECUTE IMMEDIATE 'CREATE STAGE IF NOT EXISTS ' || :v_app_stage ||
             ' DIRECTORY = (ENABLE = TRUE) ENCRYPTION = (TYPE = ''SNOWFLAKE_SSE'')';
 
-        -- Add version (skip gracefully if already exists)
+        -- Register version (REGISTER for release channels, ADD as fallback)
         BEGIN
             EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
-                ' ADD VERSION ' || :v_app_version || ' USING ''@' || :v_app_stage || '''';
-        EXCEPTION WHEN OTHER THEN NULL;
+                ' REGISTER VERSION ' || :v_app_version || ' USING ''@' || :v_app_stage || '''';
+        EXCEPTION WHEN OTHER THEN
+            BEGIN
+                EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
+                    ' ADD VERSION ' || :v_app_version || ' USING ''@' || :v_app_stage || '''';
+            EXCEPTION WHEN OTHER THEN NULL;
+            END;
         END;
 
         -- Release channel: add version to default channel
@@ -403,8 +408,6 @@ BEGIN
                 'locations:' || CHR(10) ||
                 '  access_regions:' || CHR(10) ||
                 '  - name: "' || :v_region || '"' || CHR(10) ||
-                'auto_fulfillment:' || CHR(10) ||
-                '  refresh_type: SUB_DATABASE' || CHR(10) ||
                 'resharing:' || CHR(10) ||
                 '  enabled: false';
             v_listing_sql := 'CREATE ORGANIZATION LISTING ' || :v_listing_name ||
@@ -427,8 +430,6 @@ BEGIN
                 'locations:' || CHR(10) ||
                 '  access_regions:' || CHR(10) ||
                 '  - name: "' || :v_region || '"' || CHR(10) ||
-                'auto_fulfillment:' || CHR(10) ||
-                '  refresh_type: SUB_DATABASE' || CHR(10) ||
                 'resharing:' || CHR(10) ||
                 '  enabled: false';
             v_listing_sql := 'CREATE EXTERNAL LISTING ' || :v_listing_name ||
