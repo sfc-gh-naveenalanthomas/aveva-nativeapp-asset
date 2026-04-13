@@ -100,7 +100,7 @@ def log_event(event_type, event_data=None, user_query=None):
         else:
             query_str = "NULL"
         session.sql(f"""
-            CALL CONFIG.LOG_EVENT(
+            CALL CORE.LOG_EVENT(
                 '{safe_sql_string(event_type)}',
                 PARSE_JSON('{safe_sql_string(data_json)}'),
                 {query_str}
@@ -158,7 +158,7 @@ def get_domain_distribution(_session):
 @st.cache_data(ttl=600)
 def get_schema_info(_session):
     try:
-        result = session.sql("CALL CONFIG.GET_SCHEMA_INFO()").collect()
+        result = session.sql("CALL CORE.GET_SCHEMA_INFO()").collect()
         return result[0][0] if result else ""
     except Exception:
         return ""
@@ -212,10 +212,10 @@ def check_initialized():
 def run_initialization():
     """Run full init pipeline with progress tracking and retry logic."""
     steps = [
-        ("Initializing data views...", "CALL CONFIG.INITIALIZE_VIEWS()"),
-        ("Discovering stream metadata...", "CALL CONFIG.DISCOVER_METADATA()"),
-        ("Creating unified view...", "CALL CONFIG.CREATE_UNIFIED_VIEW()"),
-        ("Generating semantic view...", "CALL CONFIG.GENERATE_SEMANTIC_VIEW()"),
+        ("Initializing data views...", "CALL CORE.INITIALIZE_VIEWS()"),
+        ("Discovering stream metadata...", "CALL CORE.DISCOVER_METADATA()"),
+        ("Creating unified view...", "CALL CORE.CREATE_UNIFIED_VIEW()"),
+        ("Generating semantic view...", "CALL CORE.GENERATE_SEMANTIC_VIEW()"),
     ]
 
     progress_bar = st.progress(0)
@@ -372,7 +372,7 @@ for d, c in domains.items():
 @st.cache_data(ttl=300)
 def get_health_status(_session):
     try:
-        result = _session.sql("CALL CONFIG.HEALTH_CHECK()").collect()
+        result = _session.sql("CALL CORE.HEALTH_CHECK()").collect()
         return json.loads(result[0][0]) if result else {"status": "UNKNOWN"}
     except Exception:
         return {"status": "UNKNOWN"}
@@ -519,24 +519,32 @@ elif page == "Talk to Your Data":
         db = get_current_database()
         semantic_view_fqn = f"{db}.DATA_VIEWS.DYNAMIC_ANALYTICS" if db else "DATA_VIEWS.DYNAMIC_ANALYTICS"
         try:
+            body = {
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": question}]}
+                ],
+                "semantic_view": semantic_view_fqn,
+            }
             resp = _snowflake.send_snow_api_request(
                 "POST",
                 "/api/v2/cortex/analyst/message",
                 {},
                 {},
-                json.dumps({
-                    "messages": [
-                        {"role": "user", "content": [{"type": "text", "text": question}]}
-                    ],
-                    "semantic_model": {"semantic_view": semantic_view_fqn},
-                }),
+                body,
                 {},
                 30000,
             )
             if resp["status"] == 200:
                 return json.loads(resp["content"])
             else:
-                return {"error": f"Analyst returned status {resp['status']}"}
+                detail = ""
+                try:
+                    detail = resp.get("content", "")
+                    if isinstance(detail, str) and len(detail) > 500:
+                        detail = detail[:500]
+                except Exception:
+                    pass
+                return {"error": f"Analyst returned status {resp['status']}: {detail}"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -571,8 +579,12 @@ elif page == "Talk to Your Data":
 
             if "error" not in analyst_resp:
                 # Parse Analyst response for SQL
+                # Response can have "message" (singular) or "messages" (plural)
                 try:
-                    for msg in analyst_resp.get("messages", [analyst_resp]):
+                    msgs = analyst_resp.get("messages", [])
+                    if not msgs and "message" in analyst_resp:
+                        msgs = [analyst_resp["message"]]
+                    for msg in msgs:
                         for content in msg.get("content", []):
                             if content.get("type") == "sql":
                                 sql = content["statement"]
@@ -643,7 +655,7 @@ elif page == "Stream Browser":
             try:
                 safe_view = selected_stream.replace('"', '""')
                 df = session.sql(
-                    f'SELECT * FROM {db_prefix()}DATA_VIEWS."{safe_view}" LIMIT {sample_size}'
+                    f'SELECT * FROM {db_prefix()}PROXY_VIEWS."{safe_view}" LIMIT {sample_size}'
                 ).to_pandas()
                 st.success(f"Loaded {len(df)} rows")
                 st.dataframe(df, use_container_width=True)
@@ -772,7 +784,7 @@ elif page == "Anomaly Detection":
             with st.spinner("Scanning signals for anomaly detection suitability..."):
                 try:
                     result = session.sql(
-                        f"CALL CONFIG.DETECT_ANOMALIES('{auto_asset}', 'AUTO', {auto_lookback})"
+                        f"CALL CORE.DETECT_ANOMALIES('{auto_asset}', 'AUTO', {auto_lookback})"
                     ).collect()
                     resp = json.loads(result[0][0]) if result else {}
                     if resp.get("status") == "CANDIDATES":
@@ -806,7 +818,7 @@ elif page == "Anomaly Detection":
                         safe_a = sel["asset"].replace("'", "''")
                         safe_s = sel["signal"].replace("'", "''")
                         r = session.sql(
-                            f"CALL CONFIG.DETECT_ANOMALIES('{safe_a}', '{safe_s}', {auto_lookback})"
+                            f"CALL CORE.DETECT_ANOMALIES('{safe_a}', '{safe_s}', {auto_lookback})"
                         ).collect()
                         resp = json.loads(r[0][0]) if r else {}
                         if resp.get("status") == "SUCCESS":
@@ -841,7 +853,7 @@ elif page == "Anomaly Detection":
                         safe_a = manual_asset.replace("'", "''")
                         safe_s = manual_signal.replace("'", "''")
                         r = session.sql(
-                            f"CALL CONFIG.DETECT_ANOMALIES('{safe_a}', '{safe_s}', {manual_lookback})"
+                            f"CALL CORE.DETECT_ANOMALIES('{safe_a}', '{safe_s}', {manual_lookback})"
                         ).collect()
                         resp = json.loads(r[0][0]) if r else {}
                         if resp.get("status") == "SUCCESS":
@@ -901,7 +913,7 @@ elif page == "Anomaly Detection":
             if st.button("Share Anomalies Back to AVEVA", type="secondary"):
                 with st.spinner("Sharing anomaly results back to provider..."):
                     try:
-                        r = session.sql("CALL CONFIG.SHARE_ANOMALIES_BACK()").collect()
+                        r = session.sql("CALL CORE.SHARE_ANOMALIES_BACK()").collect()
                         resp = json.loads(r[0][0]) if r else {}
                         if resp.get("status") == "SUCCESS":
                             st.success(resp["message"])
@@ -947,7 +959,7 @@ elif page == "Forecasting":
                     safe_a = fc_asset.replace("'", "''")
                     safe_s = fc_signal.replace("'", "''")
                     r = session.sql(
-                        f"CALL CONFIG.FORECAST_SIGNAL('{safe_a}', '{safe_s}', {fc_horizon})"
+                        f"CALL CORE.FORECAST_SIGNAL('{safe_a}', '{safe_s}', {fc_horizon})"
                     ).collect()
                     resp = json.loads(r[0][0]) if r else {}
                     if resp.get("status") == "SUCCESS":

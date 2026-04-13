@@ -14,10 +14,10 @@ CREATE APPLICATION ROLE IF NOT EXISTS APP_PUBLIC;
 CREATE OR ALTER VERSIONED SCHEMA CORE;
 GRANT USAGE ON SCHEMA CORE TO APPLICATION ROLE APP_PUBLIC;
 
-CREATE OR ALTER VERSIONED SCHEMA DATA_VIEWS;
+CREATE SCHEMA IF NOT EXISTS DATA_VIEWS;
 GRANT USAGE ON SCHEMA DATA_VIEWS TO APPLICATION ROLE APP_PUBLIC;
 
-CREATE OR ALTER VERSIONED SCHEMA CONFIG;
+CREATE SCHEMA IF NOT EXISTS CONFIG;
 GRANT USAGE ON SCHEMA CONFIG TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
@@ -146,10 +146,43 @@ CREATE TABLE IF NOT EXISTS CONFIG.EVENT_LOG (
 GRANT SELECT, INSERT ON TABLE CONFIG.EVENT_LOG TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
+-- REGISTER_REFERENCE (callback for manifest references)
+-- =====================================================
+-- Called by Snowflake when consumer binds a warehouse (or other object)
+-- to a reference declared in manifest.yml. This is the standard pattern
+-- for Native Apps to receive consumer-owned resources.
+
+CREATE OR REPLACE PROCEDURE CORE.REGISTER_REFERENCE(
+    REF_NAME VARCHAR,
+    OPERATION VARCHAR,
+    REF_OR_ALIAS VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+$$
+    BEGIN
+        CASE (OPERATION)
+            WHEN 'ADD' THEN
+                SELECT SYSTEM$SET_REFERENCE(:REF_NAME, :REF_OR_ALIAS);
+            WHEN 'REMOVE' THEN
+                SELECT SYSTEM$REMOVE_REFERENCE(:REF_NAME, :REF_OR_ALIAS);
+            WHEN 'CLEAR' THEN
+                SELECT SYSTEM$REMOVE_ALL_REFERENCES(:REF_NAME);
+        ELSE
+            RETURN 'Unknown operation: ' || OPERATION;
+        END CASE;
+        RETURN 'SUCCESS';
+    END;
+$$;
+
+GRANT USAGE ON PROCEDURE CORE.REGISTER_REFERENCE(VARCHAR, VARCHAR, VARCHAR) TO APPLICATION ROLE APP_PUBLIC;
+
+-- =====================================================
 -- INITIALIZE_VIEWS
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.INITIALIZE_VIEWS()
+CREATE OR REPLACE PROCEDURE CORE.INITIALIZE_VIEWS()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -170,37 +203,16 @@ def run(session):
         # Track progress
         session.sql("MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'INITIALIZE_VIEWS' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='RUNNING', STARTED_AT=CURRENT_TIMESTAMP(), COMPLETED_AT=NULL, DETAILS=NULL WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, STARTED_AT) VALUES (S.STEP_NAME, 'RUNNING', CURRENT_TIMESTAMP())").collect()
 
-        # Discover views from SHARED_CONTENT and PROXY_VIEWS schemas
+        # Discover views from PROXY_VIEWS schema
         view_names = []
-        view_source = {}  # track which schema each view came from
-
-        # SHARED_CONTENT: traditional shared views
-        try:
-            sc_result = session.sql("SHOW VIEWS IN SCHEMA SHARED_CONTENT").collect()
-            for row in sc_result:
-                view_names.append(row["name"])
-                view_source[row["name"]] = "SHARED_CONTENT"
-        except:
-            pass
-
-        # PROXY_VIEWS: proxy views over external data (CLD Iceberg tables)
         try:
             pv_result = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
             for row in pv_result:
-                if row["name"] not in view_source:
-                    view_names.append(row["name"])
-                    view_source[row["name"]] = "PROXY_VIEWS"
+                view_names.append(row["name"])
         except:
             pass
 
-        # Create views in DATA_VIEWS for all discovered views (no filtering)
-        view_count = 0
-        for vn in view_names:
-            quoted = vn.replace('"', '""')
-            src_schema = view_source.get(vn, "SHARED_CONTENT")
-            session.sql(f'CREATE OR REPLACE VIEW DATA_VIEWS."{quoted}" AS SELECT * FROM {src_schema}."{quoted}"').collect()
-            session.sql(f'GRANT SELECT ON VIEW DATA_VIEWS."{quoted}" TO APPLICATION ROLE APP_PUBLIC').collect()
-            view_count += 1
+        view_count = len(view_names)
 
         # Store the installing account for reference
         current_acct_rows = session.sql("SELECT CURRENT_ACCOUNT() AS ACCT").collect()
@@ -213,7 +225,7 @@ def run(session):
         session.sql(f"MERGE INTO CONFIG.APP_STATE T USING (SELECT 'VIEW_COUNT' AS KEY) S ON T.KEY = S.KEY WHEN MATCHED THEN UPDATE SET VALUE='{view_count}', UPDATED_AT=CURRENT_TIMESTAMP() WHEN NOT MATCHED THEN INSERT (KEY, VALUE) VALUES ('VIEW_COUNT', '{view_count}')").collect()
 
         # Mark progress complete
-        detail = f"{view_count} views created for account {current_account}"
+        detail = f"{view_count} proxy views discovered for account {current_account}"
         session.sql(f"UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{detail}' WHERE STEP_NAME='INITIALIZE_VIEWS'").collect()
 
         # Release lock
@@ -221,10 +233,9 @@ def run(session):
 
         return json.dumps({
             "status": "SUCCESS",
-            "message": f"Created {view_count} views from shared content",
+            "message": f"Discovered {view_count} proxy views",
             "details": {
                 "view_count": view_count,
-                "total_available": len(view_names),
                 "account": current_account
             }
         })
@@ -239,13 +250,13 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.INITIALIZE_VIEWS() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.INITIALIZE_VIEWS() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- DISCOVER_METADATA
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.DISCOVER_METADATA()
+CREATE OR REPLACE PROCEDURE CORE.DISCOVER_METADATA()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -282,6 +293,17 @@ def _detect_domain_keywords(asset_lower, signal_lower):
         return "packaging"
 
     return "general"
+
+
+def _clean_signal_name(raw):
+    """Strip UUID suffix and unit annotation from AVEVA signal names.
+    E.g. 'Active Power - 10 min rolling avg.4cda6eb5-885a-5fd4-323f-add6141de672 (kW)' -> 'Active Power - 10 min rolling avg'
+    E.g. 'BL1_ACT (°)' -> 'BL1_ACT'
+    E.g. 'Auto Stop Flag ()' -> 'Auto Stop Flag'"""
+    import re
+    cleaned = re.sub(r'\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '', raw)
+    cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', cleaned)
+    return cleaned.strip()
 
 
 def _classify_domains_ai(session, pairs):
@@ -344,10 +366,9 @@ def run(session):
         session.sql("DELETE FROM CONFIG.STREAM_METADATA").collect()
         session.sql("DELETE FROM CONFIG.ASSET_HIERARCHY").collect()
 
-        # Get views from DATA_VIEWS
-        views_result = session.sql("SHOW VIEWS IN SCHEMA DATA_VIEWS").collect()
-        skip_views = {"EVENT_LOG", "PI_STREAMS_UNIFIED", "DYNAMIC_ANALYTICS"}
-        view_names = [row["name"] for row in views_result if row["name"] not in skip_views]
+        # Get views from PROXY_VIEWS
+        views_result = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
+        view_names = [row["name"] for row in views_result]
 
         stream_count = 0
         assets = {}
@@ -361,7 +382,7 @@ def run(session):
             # Detect schema: Delta Sharing (Timestamp,Field,Value,Uom) vs PI stream
             col_rows = []
             try:
-                col_rows = session.sql(f'DESCRIBE VIEW DATA_VIEWS."{quoted}"').collect()
+                col_rows = session.sql(f'DESCRIBE VIEW PROXY_VIEWS."{quoted}"').collect()
             except:
                 pass
             col_names = set(cr["name"] for cr in col_rows)
@@ -369,12 +390,12 @@ def run(session):
 
             if is_delta_sharing:
                 # Delta Sharing long format: one view, many signals in "Field" column
-                field_rows = session.sql(f'SELECT DISTINCT "Field" FROM DATA_VIEWS."{quoted}"').collect()
+                field_rows = session.sql(f'SELECT DISTINCT "Field" FROM PROXY_VIEWS."{quoted}"').collect()
                 for fr in field_rows:
                     field_val = fr["Field"]
                     parts = field_val.split(".")
                     asset_name = ".".join(parts[:-1]) if len(parts) > 1 else field_val
-                    signal_name = parts[-1] if len(parts) > 1 else "VALUE"
+                    signal_name = _clean_signal_name(parts[-1]) if len(parts) > 1 else "VALUE"
                     stream_records.append({
                         "view": view_name, "stream": field_val,
                         "asset": asset_name, "signal": signal_name, "dtype": "NUMERIC"
@@ -396,11 +417,11 @@ def run(session):
                         parts = cn.split(".", 1)
                         if len(parts) > 1:
                             asset_name = parts[0].strip()
-                            signal_name = parts[1].strip()
+                            signal_name = _clean_signal_name(parts[1].strip())
                         elif "_" in cn:
                             first_sep = cn.index("_")
                             asset_name = cn[:first_sep].strip()
-                            signal_name = cn[first_sep+1:].strip()
+                            signal_name = _clean_signal_name(cn[first_sep+1:].strip())
                         else:
                             asset_name = table_base
                             signal_name = cn
@@ -415,7 +436,7 @@ def run(session):
                     stream_name = view_name.replace("_", " ")
                     parts = stream_name.split(".")
                     asset_name = ".".join(parts[:-1]) if len(parts) > 1 else stream_name
-                    signal_name = parts[-1] if len(parts) > 1 else "VALUE"
+                    signal_name = _clean_signal_name(parts[-1]) if len(parts) > 1 else "VALUE"
 
                     data_type = "NUMERIC"
                     for cr in col_rows:
@@ -496,13 +517,13 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.DISCOVER_METADATA() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.DISCOVER_METADATA() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- CREATE_UNIFIED_VIEW
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.CREATE_UNIFIED_VIEW()
+CREATE OR REPLACE PROCEDURE CORE.CREATE_UNIFIED_VIEW()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -532,7 +553,7 @@ def run(session):
             if vn not in view_is_delta:
                 quoted_vn = vn.replace('"', '""')
                 try:
-                    cols = session.sql(f'DESCRIBE VIEW DATA_VIEWS."{quoted_vn}"').collect()
+                    cols = session.sql(f'DESCRIBE VIEW PROXY_VIEWS."{quoted_vn}"').collect()
                     col_names = set(c["name"] for c in cols)
                     view_is_delta[vn] = "Field" in col_names and "Uom" in col_names
                 except:
@@ -557,7 +578,7 @@ def run(session):
                     f'NULL::BOOLEAN AS IS_ANNOTATED, NULL::NUMBER AS SYSTEM_STATE_CODE, '
                     f'NULL::VARCHAR AS DIGITAL_STATE_NAME, '
                     f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
-                    f'FROM DATA_VIEWS."{quoted_vn}" WHERE "Field" = \'{safe_stream}\''
+                    f'FROM PROXY_VIEWS."{quoted_vn}" WHERE "Field" = \'{safe_stream}\''
                 )
             elif dtype == "WIDE":
                 # Wide-format: each stream_name is a column name in the view
@@ -568,7 +589,7 @@ def run(session):
                     f'NULL::BOOLEAN AS IS_ANNOTATED, NULL::NUMBER AS SYSTEM_STATE_CODE, '
                     f'NULL::VARCHAR AS DIGITAL_STATE_NAME, '
                     f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
-                    f'FROM DATA_VIEWS."{quoted_vn}" WHERE "{safe_col}" IS NOT NULL'
+                    f'FROM PROXY_VIEWS."{quoted_vn}" WHERE "{safe_col}" IS NOT NULL'
                 )
             else:
                 # Classic PI stream format
@@ -580,7 +601,7 @@ def run(session):
                     f'"IsAnnotated" AS IS_ANNOTATED, "SystemStateCode" AS SYSTEM_STATE_CODE, '
                     f'"DigitalStateName" AS DIGITAL_STATE_NAME, '
                     f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
-                    f'FROM DATA_VIEWS."{quoted_vn}"'
+                    f'FROM PROXY_VIEWS."{quoted_vn}"'
                 )
 
         batch_size = 50
@@ -617,13 +638,13 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.CREATE_UNIFIED_VIEW() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.CREATE_UNIFIED_VIEW() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- GENERATE_SEMANTIC_VIEW
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.GENERATE_SEMANTIC_VIEW()
+CREATE OR REPLACE PROCEDURE CORE.GENERATE_SEMANTIC_VIEW()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -699,13 +720,13 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.GENERATE_SEMANTIC_VIEW() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.GENERATE_SEMANTIC_VIEW() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- IS_INITIALIZED
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.IS_INITIALIZED()
+CREATE OR REPLACE PROCEDURE CORE.IS_INITIALIZED()
 RETURNS BOOLEAN
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -723,13 +744,13 @@ def run(session):
         return False
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.IS_INITIALIZED() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.IS_INITIALIZED() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- GET_SCHEMA_INFO
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.GET_SCHEMA_INFO()
+CREATE OR REPLACE PROCEDURE CORE.GET_SCHEMA_INFO()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -769,13 +790,13 @@ def run(session):
     return "\n".join(lines)
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.GET_SCHEMA_INFO() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.GET_SCHEMA_INFO() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- LOG_EVENT
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.LOG_EVENT(
+CREATE OR REPLACE PROCEDURE CORE.LOG_EVENT(
     p_event_type VARCHAR,
     p_event_data VARIANT,
     p_user_query VARCHAR
@@ -818,13 +839,13 @@ def run(session, p_event_type, p_event_data, p_user_query):
     return "Event logged"
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.LOG_EVENT(VARCHAR, VARIANT, VARCHAR) TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.LOG_EVENT(VARCHAR, VARIANT, VARCHAR) TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- REINITIALIZE (full reset + re-run pipeline)
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.REINITIALIZE()
+CREATE OR REPLACE PROCEDURE CORE.REINITIALIZE()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -860,16 +881,16 @@ def run(session):
             pass
 
         # Re-run initialization pipeline
-        r1 = session.sql("CALL CONFIG.INITIALIZE_VIEWS()").collect()
+        r1 = session.sql("CALL CORE.INITIALIZE_VIEWS()").collect()
         results["initialize_views"] = json.loads(r1[0][0]) if len(r1) > 0 else {"status": "ERROR", "message": "No result"}
 
-        r2 = session.sql("CALL CONFIG.DISCOVER_METADATA()").collect()
+        r2 = session.sql("CALL CORE.DISCOVER_METADATA()").collect()
         results["discover_metadata"] = json.loads(r2[0][0]) if len(r2) > 0 else {"status": "ERROR", "message": "No result"}
 
-        r3 = session.sql("CALL CONFIG.CREATE_UNIFIED_VIEW()").collect()
+        r3 = session.sql("CALL CORE.CREATE_UNIFIED_VIEW()").collect()
         results["create_unified_view"] = json.loads(r3[0][0]) if len(r3) > 0 else {"status": "ERROR", "message": "No result"}
 
-        r4 = session.sql("CALL CONFIG.GENERATE_SEMANTIC_VIEW()").collect()
+        r4 = session.sql("CALL CORE.GENERATE_SEMANTIC_VIEW()").collect()
         results["generate_semantic_view"] = json.loads(r4[0][0]) if len(r4) > 0 else {"status": "ERROR", "message": "No result"}
 
         all_ok = all(r.get("status") == "SUCCESS" for r in results.values())
@@ -885,13 +906,13 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": results})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.REINITIALIZE() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.REINITIALIZE() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- HEALTH_CHECK
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.HEALTH_CHECK()
+CREATE OR REPLACE PROCEDURE CORE.HEALTH_CHECK()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -974,13 +995,13 @@ def run(session):
     })
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.HEALTH_CHECK() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.HEALTH_CHECK() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- GET_INIT_STATUS (for Streamlit progress UI)
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.GET_INIT_STATUS()
+CREATE OR REPLACE PROCEDURE CORE.GET_INIT_STATUS()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -1045,7 +1066,7 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.GET_INIT_STATUS() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.GET_INIT_STATUS() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- DETECT_ANOMALIES
@@ -1055,7 +1076,7 @@ GRANT USAGE ON PROCEDURE CONFIG.GET_INIT_STATUS() TO APPLICATION ROLE APP_PUBLIC
 -- If no signal is specified, auto-detects the best
 -- candidates based on variance and data density.
 
-CREATE OR REPLACE PROCEDURE CONFIG.DETECT_ANOMALIES(
+CREATE OR REPLACE PROCEDURE CORE.DETECT_ANOMALIES(
     p_asset_name VARCHAR,
     p_signal_name VARCHAR,
     p_lookback_days NUMBER
@@ -1190,13 +1211,13 @@ def run(session, p_asset_name, p_signal_name, p_lookback_days):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.DETECT_ANOMALIES(VARCHAR, VARCHAR, NUMBER) TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.DETECT_ANOMALIES(VARCHAR, VARCHAR, NUMBER) TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- FORECAST_SIGNAL
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.FORECAST_SIGNAL(
+CREATE OR REPLACE PROCEDURE CORE.FORECAST_SIGNAL(
     p_asset_name VARCHAR,
     p_signal_name VARCHAR,
     p_horizon_days NUMBER
@@ -1356,13 +1377,13 @@ def run(session, p_asset_name, p_signal_name, p_horizon_days):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.FORECAST_SIGNAL(VARCHAR, VARCHAR, NUMBER) TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.FORECAST_SIGNAL(VARCHAR, VARCHAR, NUMBER) TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- SHARE_ANOMALIES_BACK (consumer -> provider)
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CONFIG.SHARE_ANOMALIES_BACK()
+CREATE OR REPLACE PROCEDURE CORE.SHARE_ANOMALIES_BACK()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -1420,7 +1441,7 @@ def run(session):
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CONFIG.SHARE_ANOMALIES_BACK() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.SHARE_ANOMALIES_BACK() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- Streamlit Application
