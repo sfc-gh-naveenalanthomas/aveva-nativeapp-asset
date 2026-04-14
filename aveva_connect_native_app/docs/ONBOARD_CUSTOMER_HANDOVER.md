@@ -555,3 +555,64 @@ BL1_ACT
 ```
 
 These clean names are stored in `CONFIG.STREAM_METADATA.SIGNAL_NAME` and appear in the unified view and semantic view. The raw column names (with UUIDs) are preserved in `CONFIG.STREAM_METADATA.STREAM_NAME` for use as the actual column reference in wide-format views.
+
+---
+
+## 18. External Distribution (Production)
+
+The current setup uses **ORGANIZATION** distribution (internal listing within the same Snowflake org). For production deployment to customers outside the org, the app package must be switched to **EXTERNAL** distribution.
+
+### What Changes
+
+| Aspect | ORGANIZATION (current) | EXTERNAL (production) |
+|--------|----------------------|----------------------|
+| Listing type | `CREATE ORGANIZATION LISTING` | `CREATE EXTERNAL LISTING` |
+| Distribution | `INTERNAL` | `EXTERNAL` |
+| Security review | Not required | **Required** — Snowflake automated scan |
+| Target | `organization_targets.access.account` | `targets.accounts` |
+| Cross-region | Same region only | Requires `auto_fulfillment` with `refresh_type: SUB_DATABASE` |
+
+### Steps to Switch to External
+
+1. **Change distribution mode:**
+   ```sql
+   ALTER APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG SET DISTRIBUTION = 'EXTERNAL';
+   ```
+
+2. **Wait for security scan:** Snowflake automatically scans the setup.sql and app code. Check status:
+   ```sql
+   SHOW VERSIONS IN APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG;
+   -- Look for review_status = 'APPROVED'
+   ```
+   The scan checks for: direct data access outside the app, unsafe dynamic SQL, privilege escalation patterns.
+
+3. **Update ONBOARDING_CONFIG:**
+   ```sql
+   UPDATE AVEVA_CONNECT.ADMIN.ONBOARDING_CONFIG
+   SET CONFIG_VALUE = 'EXTERNAL' WHERE CONFIG_KEY = 'DISTRIBUTION_MODE';
+   ```
+
+4. **Onboard customer as usual:** The ONBOARD_CUSTOMER proc handles both modes — when `DISTRIBUTION_MODE = 'EXTERNAL'`, it creates an `EXTERNAL LISTING` with `targets.accounts` instead of an organization listing.
+
+5. **Cross-region customers:** If the consumer is in a different region, add `auto_fulfillment` to the listing YAML:
+   ```yaml
+   auto_fulfillment:
+     refresh_type: SUB_DATABASE
+     refresh_schedule: "10 MINUTE"
+   ```
+
+### Manifest Version Constraints
+
+With `manifest_version: 2`:
+- **Patches** (within a version): Can update code, but **cannot** change the `privileges` section
+- **New versions**: Required when changing privileges, restricted features, or references
+- Always register a new version for privilege changes, then add to the release channel and update the directive
+
+### Consumer Experience (External)
+
+The consumer experience is identical regardless of ORGANIZATION vs EXTERNAL:
+1. Install app from listing (Snowsight or `CREATE APPLICATION ... FROM LISTING`)
+2. Grant external data access (Snowsight auto-prompts, or `SYSTEM$SET_APPLICATION_RESTRICTED_FEATURE_ACCESS`)
+3. Grant Cortex AI privileges (Snowsight auto-prompts, or `GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE`)
+4. Bind warehouse (Snowsight auto-prompts, or `CALL CORE.REGISTER_REFERENCE`)
+5. Open Streamlit UI → Initialize → Use
