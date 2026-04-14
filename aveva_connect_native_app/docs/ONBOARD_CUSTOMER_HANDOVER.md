@@ -462,3 +462,96 @@ Provider Account                                         Consumer Account
 | **CURRENT_REGION() default** | When no region is specified, the procedure uses the provider's own region. This requires no elevated privileges and is correct for same-region deployments. |
 | **SHOW REGIONS validation** | User-provided regions are validated against Snowflake's authoritative region catalog. This catches typos and invalid input before any objects are created. |
 | **Auto-fulfillment** | `LISTING_AUTO_REFRESH` + `auto_fulfillment: refresh_type: SUB_DATABASE` enables Snowflake-managed replication for cross-region consumers. No manual replication setup required. |
+
+---
+
+## 15. Post-Install: Consumer-Side Steps
+
+After the consumer installs the app from the listing, two permissions must be granted before the app can function. When installing via Snowsight, both are prompted automatically on first launch.
+
+### External Data Access (Required)
+
+The app's `manifest.yml` declares `restricted_features: external_data`. This means the consumer must explicitly allow the app to resolve the shared CLD Iceberg tables through the proxy views.
+
+**Via Snowsight:** The consumer sees an automatic prompt on first launch. Click "Grant".
+
+**Via SQL** (e.g., for automated or CLI-based installs):
+```sql
+SELECT SYSTEM$SET_APPLICATION_RESTRICTED_FEATURE_ACCESS(
+    '<app_name>', 'EXTERNAL_DATA', '{"allowed_cloud_providers": "all"}'
+);
+```
+
+Without this grant, all queries against proxy views fail with: `Failure during expansion of view ... Error in secure object` or `Insufficient permission to resolve external/iceberg table`.
+
+### Warehouse Binding (Required)
+
+The manifest declares a `WAREHOUSE_REF` reference. Snowsight prompts the consumer to select a warehouse during install.
+
+**Via SQL:**
+```sql
+CALL <app_name>.CORE.REGISTER_REFERENCE(
+    'WAREHOUSE_REF', 'ADD',
+    SYSTEM$REFERENCE('WAREHOUSE', 'COMPUTE_WH', 'SESSION', 'USAGE')
+);
+```
+
+### Cortex AI Access (Required for NL Queries)
+
+The manifest requests `IMPORTED PRIVILEGES ON SNOWFLAKE DB`. Snowsight prompts this automatically.
+
+**Via SQL:**
+```sql
+GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO APPLICATION <app_name>;
+```
+
+---
+
+## 16. App Schema Architecture
+
+Once installed, the app creates the following schemas:
+
+| Schema | Type | Purpose |
+|--------|------|---------|
+| `CORE` | Versioned (`CREATE OR ALTER VERSIONED SCHEMA`) | All 13 stored procedures + Streamlit app. Replaced entirely on each version upgrade. |
+| `CONFIG` | Non-versioned (`CREATE SCHEMA IF NOT EXISTS`) | Runtime state: APP_STATE, STREAM_METADATA, ASSET_HIERARCHY, ANOMALY_RESULTS, ANOMALY_SHARE_BACK, INIT_LOCK, INIT_PROGRESS, EVENT_LOG. **Persists across upgrades.** |
+| `DATA_VIEWS` | Non-versioned (`CREATE SCHEMA IF NOT EXISTS`) | PI_STREAMS_UNIFIED (unified view) and DYNAMIC_ANALYTICS (semantic view). Recreated by the init pipeline. |
+| `PROXY_VIEWS` | App package share | Secure views over CLD Iceberg tables. Managed by the provider, shared into the app via the application package share. Not created by setup.sql. |
+
+### Initialization Pipeline
+
+The app runs a 4-step pipeline on first launch (triggered by the Streamlit UI):
+
+1. **CORE.INITIALIZE_VIEWS()** -- Discovers proxy views in PROXY_VIEWS schema, stores count
+2. **CORE.DISCOVER_METADATA()** -- Inspects each view, detects format (Delta Sharing / wide / classic PI), extracts asset/signal names, classifies domains via Cortex AI
+3. **CORE.CREATE_UNIFIED_VIEW()** -- Builds `DATA_VIEWS.PI_STREAMS_UNIFIED` as a UNION ALL across all proxy views with a normalized schema
+4. **CORE.GENERATE_SEMANTIC_VIEW()** -- Creates `DATA_VIEWS.DYNAMIC_ANALYTICS` semantic view for Cortex Analyst
+
+To re-run: `CALL <app_name>.CORE.REINITIALIZE()`
+
+---
+
+## 17. Signal Name Cleaning
+
+AVEVA PI Data Historian signal names often contain embedded UUIDs and unit annotations:
+
+```
+Active Power - 10 min rolling avg.4cda6eb5-885a-5fd4-323f-add6141de672 (kW)
+Expected Power.f3a878d6-3edc-5585-14ea-008cd1cec068 (kW)
+Revenue - Monthly.1d8f39d7-4532-5b81-0652-bb84f250bd9a ()
+BL1_ACT (°)
+```
+
+During DISCOVER_METADATA, the app automatically strips:
+- **UUID suffixes:** `.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` pattern
+- **Unit annotations:** trailing `(kW)`, `(°C)`, `(%)`, `()`, etc.
+
+Resulting clean names:
+```
+Active Power - 10 min rolling avg
+Expected Power
+Revenue - Monthly
+BL1_ACT
+```
+
+These clean names are stored in `CONFIG.STREAM_METADATA.SIGNAL_NAME` and appear in the unified view and semantic view. The raw column names (with UUIDs) are preserved in `CONFIG.STREAM_METADATA.STREAM_NAME` for use as the actual column reference in wide-format views.

@@ -1,27 +1,39 @@
 -- =====================================================
 -- AVEVA CONNECT PI Data Historian - Native App Setup
 -- =====================================================
--- FULLY DYNAMIC: Discovers shared PI stream views,
--- parses asset hierarchy from stream names,
--- detects domain categories, generates semantic views
--- =====================================================
--- All stored procedures use Python (Snowpark) with
--- structured JSON responses and idempotency controls.
+--
+-- Architecture:
+--   CORE       (versioned)     - Stored procedures + Streamlit app
+--   CONFIG     (non-versioned) - Runtime state tables (persist across upgrades)
+--   DATA_VIEWS (non-versioned) - Unified view (PI_STREAMS_UNIFIED) + semantic view (DYNAMIC_ANALYTICS)
+--   PROXY_VIEWS (app package)  - Secure views over CLD Iceberg tables (provider-managed, not in this file)
+--
+-- Initialization pipeline (called by consumer or Streamlit UI):
+--   1. CORE.INITIALIZE_VIEWS()       - Discovers proxy views from PROXY_VIEWS schema
+--   2. CORE.DISCOVER_METADATA()      - Inspects each view, extracts asset/signal metadata, classifies domains via Cortex AI
+--   3. CORE.CREATE_UNIFIED_VIEW()    - Builds PI_STREAMS_UNIFIED (UNION ALL across all proxy views, normalized schema)
+--   4. CORE.GENERATE_SEMANTIC_VIEW() - Creates DYNAMIC_ANALYTICS semantic view for Cortex Analyst
+--
+-- All stored procedures return structured JSON: {"status": "SUCCESS|ERROR", "message": "...", "details": {...}}
+--
 -- =====================================================
 
 CREATE APPLICATION ROLE IF NOT EXISTS APP_PUBLIC;
 
+-- CORE: versioned schema - all procs and Streamlit are replaced on each upgrade
 CREATE OR ALTER VERSIONED SCHEMA CORE;
 GRANT USAGE ON SCHEMA CORE TO APPLICATION ROLE APP_PUBLIC;
 
+-- DATA_VIEWS: non-versioned - holds the unified view and semantic view (recreated by procs)
 CREATE SCHEMA IF NOT EXISTS DATA_VIEWS;
 GRANT USAGE ON SCHEMA DATA_VIEWS TO APPLICATION ROLE APP_PUBLIC;
 
+-- CONFIG: non-versioned - runtime state tables persist across app upgrades
 CREATE SCHEMA IF NOT EXISTS CONFIG;
 GRANT USAGE ON SCHEMA CONFIG TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- Configuration & State Tables
+-- Configuration & State Tables (CONFIG schema)
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS CONFIG.APP_STATE (
@@ -57,11 +69,8 @@ CREATE TABLE IF NOT EXISTS CONFIG.ASSET_HIERARCHY (
 GRANT SELECT, INSERT, DELETE ON TABLE CONFIG.ASSET_HIERARCHY TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- Account-to-View Mapping (multi-tenant isolation)
+-- Anomaly Detection Results
 -- =====================================================
--- Provider populates this table to control which views
--- each installing consumer account can access.
--- If no mapping exists for an account, all views are granted (backwards compat).
 
 CREATE TABLE IF NOT EXISTS CONFIG.ANOMALY_RESULTS (
     RESULT_ID VARCHAR(36) DEFAULT UUID_STRING() PRIMARY KEY,
@@ -179,7 +188,12 @@ $$;
 GRANT USAGE ON PROCEDURE CORE.REGISTER_REFERENCE(VARCHAR, VARCHAR, VARCHAR) TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- INITIALIZE_VIEWS
+-- INITIALIZE_VIEWS (Step 1 of init pipeline)
+-- =====================================================
+-- Discovers proxy views in the PROXY_VIEWS schema
+-- (provider-managed secure views over CLD Iceberg tables).
+-- Stores view count in CONFIG.APP_STATE. Uses a lock
+-- to prevent concurrent initialization.
 -- =====================================================
 
 CREATE OR REPLACE PROCEDURE CORE.INITIALIZE_VIEWS()
@@ -253,7 +267,13 @@ $$;
 GRANT USAGE ON PROCEDURE CORE.INITIALIZE_VIEWS() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- DISCOVER_METADATA
+-- DISCOVER_METADATA (Step 2 of init pipeline)
+-- =====================================================
+-- Scans all views in PROXY_VIEWS, detects data format
+-- (Delta Sharing long, wide-format, or classic PI),
+-- extracts asset/signal names, classifies industrial
+-- domains via Cortex AI, and populates CONFIG.STREAM_METADATA
+-- and CONFIG.ASSET_HIERARCHY.
 -- =====================================================
 
 CREATE OR REPLACE PROCEDURE CORE.DISCOVER_METADATA()
@@ -520,7 +540,13 @@ $$;
 GRANT USAGE ON PROCEDURE CORE.DISCOVER_METADATA() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- CREATE_UNIFIED_VIEW
+-- CREATE_UNIFIED_VIEW (Step 3 of init pipeline)
+-- =====================================================
+-- Reads STREAM_METADATA, builds a UNION ALL across all
+-- proxy views (normalizing Delta Sharing, wide-format,
+-- and classic PI schemas into a single schema), and
+-- creates DATA_VIEWS.PI_STREAMS_UNIFIED.
+-- Batches into sub-views if >50 streams.
 -- =====================================================
 
 CREATE OR REPLACE PROCEDURE CORE.CREATE_UNIFIED_VIEW()
@@ -641,7 +667,11 @@ $$;
 GRANT USAGE ON PROCEDURE CORE.CREATE_UNIFIED_VIEW() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- GENERATE_SEMANTIC_VIEW
+-- GENERATE_SEMANTIC_VIEW (Step 4 of init pipeline)
+-- =====================================================
+-- Creates DATA_VIEWS.DYNAMIC_ANALYTICS semantic view
+-- on top of PI_STREAMS_UNIFIED. This enables Cortex
+-- Analyst natural language queries against the data.
 -- =====================================================
 
 CREATE OR REPLACE PROCEDURE CORE.GENERATE_SEMANTIC_VIEW()
