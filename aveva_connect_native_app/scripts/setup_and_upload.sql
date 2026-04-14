@@ -119,7 +119,7 @@ CREATE STAGE IF NOT EXISTS AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE
 PUT file://manifest.yml             @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/           OVERWRITE=TRUE AUTO_COMPRESS=FALSE;
 PUT file://setup.sql                @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/           OVERWRITE=TRUE AUTO_COMPRESS=FALSE;
 PUT file://README.md                @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/           OVERWRITE=TRUE AUTO_COMPRESS=FALSE;
-PUT file://streamlit/app.py         @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/streamlit/ OVERWRITE=TRUE AUTO_COMPRESS=FALSE;
+PUT file://streamlit/main.py        @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/streamlit/ OVERWRITE=TRUE AUTO_COMPRESS=FALSE;
 PUT file://streamlit/environment.yml @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/streamlit/ OVERWRITE=TRUE AUTO_COMPRESS=FALSE;
 
 -- Option B: Snow CLI (run from terminal instead of the PUTs above)
@@ -127,7 +127,7 @@ PUT file://streamlit/environment.yml @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/stream
 -- snow stage copy manifest.yml             @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/           --overwrite --connection my_polaris_connection
 -- snow stage copy setup.sql                @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/           --overwrite --connection my_polaris_connection
 -- snow stage copy README.md                @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/           --overwrite --connection my_polaris_connection
--- snow stage copy streamlit/app.py         @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/streamlit/ --overwrite --connection my_polaris_connection
+-- snow stage copy streamlit/main.py        @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/streamlit/ --overwrite --connection my_polaris_connection
 -- snow stage copy streamlit/environment.yml @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE/streamlit/ --overwrite --connection my_polaris_connection
 
 -- Verify files uploaded:
