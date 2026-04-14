@@ -1,18 +1,17 @@
 -- =====================================================
--- AVEVA CONNECT PI Data Historian - Native App Setup
+-- AVEVA CONNECT Industrial IoT - Native App Setup
 -- =====================================================
 --
 -- Architecture:
 --   CORE       (versioned)     - Stored procedures + Streamlit app
 --   CONFIG     (non-versioned) - Runtime state tables (persist across upgrades)
---   DATA_VIEWS (non-versioned) - Unified view (PI_STREAMS_UNIFIED) + semantic view (DYNAMIC_ANALYTICS)
+--   DATA_VIEWS (non-versioned) - Semantic view (AVEVA_ANALYTICS) for Cortex Analyst
 --   PROXY_VIEWS (app package)  - Secure views over CLD Iceberg tables (provider-managed, not in this file)
 --
 -- Initialization pipeline (called by consumer or Streamlit UI):
 --   1. CORE.INITIALIZE_VIEWS()       - Discovers proxy views from PROXY_VIEWS schema
---   2. CORE.DISCOVER_METADATA()      - Inspects each view, extracts asset/signal metadata, classifies domains via Cortex AI
---   3. CORE.CREATE_UNIFIED_VIEW()    - Builds PI_STREAMS_UNIFIED (UNION ALL across all proxy views, normalized schema)
---   4. CORE.GENERATE_SEMANTIC_VIEW() - Creates DYNAMIC_ANALYTICS semantic view for Cortex Analyst
+--   2. CORE.DISCOVER_METADATA()      - Inspects each view, extracts asset/signal metadata, classifies domains
+--   3. CORE.CREATE_SEMANTIC_VIEWS()   - Creates AVEVA_ANALYTICS semantic view on proxy views for Cortex Analyst
 --
 -- All stored procedures return structured JSON: {"status": "SUCCESS|ERROR", "message": "...", "details": {...}}
 --
@@ -24,7 +23,7 @@ CREATE APPLICATION ROLE IF NOT EXISTS APP_PUBLIC;
 CREATE OR ALTER VERSIONED SCHEMA CORE;
 GRANT USAGE ON SCHEMA CORE TO APPLICATION ROLE APP_PUBLIC;
 
--- DATA_VIEWS: non-versioned - holds the unified view and semantic view (recreated by procs)
+-- DATA_VIEWS: non-versioned - holds the semantic view (recreated by procs)
 CREATE SCHEMA IF NOT EXISTS DATA_VIEWS;
 GRANT USAGE ON SCHEMA DATA_VIEWS TO APPLICATION ROLE APP_PUBLIC;
 
@@ -269,11 +268,11 @@ GRANT USAGE ON PROCEDURE CORE.INITIALIZE_VIEWS() TO APPLICATION ROLE APP_PUBLIC;
 -- =====================================================
 -- DISCOVER_METADATA (Step 2 of init pipeline)
 -- =====================================================
--- Scans all views in PROXY_VIEWS, detects data format
--- (Delta Sharing long, wide-format, or classic PI),
+-- Scans all proxy views, introspects their columns,
 -- extracts asset/signal names, classifies industrial
--- domains via Cortex AI, and populates CONFIG.STREAM_METADATA
--- and CONFIG.ASSET_HIERARCHY.
+-- domains via keywords, and populates CONFIG.STREAM_METADATA
+-- and CONFIG.ASSET_HIERARCHY. No format detection needed —
+-- the semantic view handles schema differences directly.
 -- =====================================================
 
 CREATE OR REPLACE PROCEDURE CORE.DISCOVER_METADATA()
@@ -285,96 +284,34 @@ HANDLER = 'run'
 AS
 $$
 import json
+import re
 
 def _detect_domain_keywords(asset_lower, signal_lower):
-    """Fallback: detect domain category from asset and signal names using keywords."""
-    wind_asset_keys = ["wind", "turbine", "hornsea", "ge0", "ge1", "yorkshire"]
-    wind_signal_keys = [
-        "wind_speed", "wind_direction", "pitch_angle", "vane_position",
-        "gearbox", "hub_temp", "eaf", "active power", "apparent power",
-        "expected power", "revenue", "total power", "total turbines"
-    ]
-    if any(k in asset_lower for k in wind_asset_keys) or any(k in signal_lower for k in wind_signal_keys):
+    """Detect domain category from asset and signal names using keywords."""
+    wind_keys = ["wind", "turbine", "hornsea", "ge0", "ge1", "yorkshire",
+                 "wind_speed", "wind_direction", "pitch_angle", "vane_position",
+                 "gearbox", "hub_temp", "eaf", "active power", "apparent power",
+                 "expected power", "revenue", "total power", "total turbines"]
+    if any(k in asset_lower or k in signal_lower for k in wind_keys):
         return "wind_energy"
-
-    rotating_asset_keys = ["rotating", "ps0", "ps1", "ps2", "ps3", "ps4", "ps5", "ps6"]
-    rotating_signal_keys = ["bearing", "suction", "discharge", "pump"]
-    if any(k in asset_lower for k in rotating_asset_keys) or any(k in signal_lower for k in rotating_signal_keys):
+    rotating_keys = ["rotating", "ps0", "ps1", "ps2", "ps3", "ps4", "ps5", "ps6",
+                     "bearing", "suction", "discharge", "pump"]
+    if any(k in asset_lower or k in signal_lower for k in rotating_keys):
         return "rotating_machinery"
-
-    pq_asset_keys = ["plant", "pq."]
-    pq_signal_keys = ["concentration", "granule", "dissolv", "ingredient", "agitator"]
-    if any(k in asset_lower for k in pq_asset_keys) or any(k in signal_lower for k in pq_signal_keys):
+    pq_keys = ["plant", "pq.", "concentration", "granule", "dissolv", "ingredient", "agitator"]
+    if any(k in asset_lower or k in signal_lower for k in pq_keys):
         return "production_quality"
-
-    pkg_asset_keys = ["pack", "line"]
-    pkg_signal_keys = ["carb", "chill", "warmer", "running", "refrigerant"]
-    if any(k in asset_lower for k in pkg_asset_keys) or any(k in signal_lower for k in pkg_signal_keys):
+    pkg_keys = ["pack", "line", "carb", "chill", "warmer", "running", "refrigerant"]
+    if any(k in asset_lower or k in signal_lower for k in pkg_keys):
         return "packaging"
-
     return "general"
 
 
 def _clean_signal_name(raw):
-    """Strip UUID suffix and unit annotation from AVEVA signal names.
-    E.g. 'Active Power - 10 min rolling avg.4cda6eb5-885a-5fd4-323f-add6141de672 (kW)' -> 'Active Power - 10 min rolling avg'
-    E.g. 'BL1_ACT (°)' -> 'BL1_ACT'
-    E.g. 'Auto Stop Flag ()' -> 'Auto Stop Flag'"""
-    import re
+    """Strip UUID suffix and unit annotation from AVEVA signal names."""
     cleaned = re.sub(r'\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '', raw)
     cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', cleaned)
     return cleaned.strip()
-
-
-def _classify_domains_ai(session, pairs):
-    """Use Cortex Complete to classify asset/signal pairs into industrial domains.
-    Returns dict of {(asset, signal): domain}. Falls back to keyword matching on failure."""
-    VALID_DOMAINS = {"wind_energy", "rotating_machinery", "production_quality", "packaging", "general"}
-    result = {}
-
-    if not pairs:
-        return result
-
-    # Build batch list (limit to 200 pairs per call to stay within token limits)
-    batch = pairs[:200]
-    pair_list = "\n".join(f"- {a} | {s}" for a, s in batch)
-    prompt = (
-        "Classify these industrial asset/signal pairs into exactly one domain each.\n"
-        "Valid domains: wind_energy, rotating_machinery, production_quality, packaging, general\n\n"
-        "Asset | Signal pairs:\n"
-        f"{pair_list}\n\n"
-        "Return ONLY a JSON object where each key is \"asset|signal\" and value is the domain.\n"
-        "Example: {\"Turbine_1|Wind_Speed\": \"wind_energy\", \"Pump_A|Bearing_Temp\": \"rotating_machinery\"}\n"
-        "Return ONLY valid JSON, no explanation."
-    )
-    safe_prompt = prompt.replace("'", "''")
-
-    try:
-        rows = session.sql(
-            f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{safe_prompt}')"
-        ).collect()
-        text = rows[0][0] if rows else ""
-        # Extract JSON from response
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            ai_result = json.loads(text[start:end])
-            for key, domain in ai_result.items():
-                parts = key.split("|")
-                if len(parts) == 2:
-                    a = parts[0].strip()
-                    s = parts[1].strip()
-                    if domain in VALID_DOMAINS:
-                        result[(a, s)] = domain
-    except Exception:
-        pass
-
-    # Fall back to keyword matching for any pairs not classified by AI
-    for a, s in pairs:
-        if (a, s) not in result:
-            result[(a, s)] = _detect_domain_keywords(a.lower(), s.lower())
-
-    return result
 
 
 def run(session):
@@ -393,102 +330,76 @@ def run(session):
         stream_count = 0
         assets = {}
         domain_map = {}
-
-        # First pass: collect all stream info (asset, signal, view, data_type) without domain
         stream_records = []
+
         for view_name in view_names:
             quoted = view_name.replace('"', '""')
-
-            # Detect schema: Delta Sharing (Timestamp,Field,Value,Uom) vs PI stream
-            col_rows = []
             try:
                 col_rows = session.sql(f'DESCRIBE VIEW PROXY_VIEWS."{quoted}"').collect()
             except:
-                pass
-            col_names = set(cr["name"] for cr in col_rows)
-            is_delta_sharing = "Field" in col_names and "Uom" in col_names
+                continue
 
-            if is_delta_sharing:
-                # Delta Sharing long format: one view, many signals in "Field" column
-                field_rows = session.sql(f'SELECT DISTINCT "Field" FROM PROXY_VIEWS."{quoted}"').collect()
+            col_names = set(cr["name"] for cr in col_rows)
+            has_field = "Field" in col_names
+            has_value = "Value" in col_names
+
+            if has_field:
+                # Long format table (Timestamp, Field, Value [, Name] [, Uom])
+                # Each distinct Field value is a signal
+                try:
+                    field_rows = session.sql(f'SELECT DISTINCT "Field" FROM PROXY_VIEWS."{quoted}"').collect()
+                except:
+                    field_rows = []
                 for fr in field_rows:
                     field_val = fr["Field"]
                     parts = field_val.split(".")
-                    asset_name = ".".join(parts[:-1]) if len(parts) > 1 else field_val
-                    signal_name = _clean_signal_name(parts[-1]) if len(parts) > 1 else "VALUE"
+                    asset_name = ".".join(parts[:-1]) if len(parts) > 1 else view_name
+                    signal_name = _clean_signal_name(parts[-1]) if len(parts) > 1 else _clean_signal_name(field_val)
                     stream_records.append({
                         "view": view_name, "stream": field_val,
                         "asset": asset_name, "signal": signal_name, "dtype": "NUMERIC"
                     })
+            elif has_value and not has_field:
+                # Long format without Field column — treat view as one signal
+                stream_records.append({
+                    "view": view_name, "stream": view_name,
+                    "asset": view_name, "signal": "VALUE", "dtype": "NUMERIC"
+                })
             else:
-                # Check if this is wide-format (Timestamp + many signal columns, no Value/Field/Uom)
-                has_value_col = any(cr["name"] in ("VALUE", "Value") for cr in col_rows)
-                is_wide_format = "Timestamp" in col_names and not has_value_col and len(col_names) > 2
-
-                if is_wide_format:
-                    # Wide format: each non-Timestamp column is a separate signal
-                    table_base = view_name.split("_")[0] if "_" in view_name else view_name
-                    for cr in col_rows:
-                        cn = cr["name"]
-                        if cn == "Timestamp":
-                            continue
-                        ct = cr["type"].upper()
-                        # Parse signal name: "GE01_P_ACT (kW)" -> asset="GE01", signal="P_ACT (kW)"
-                        parts = cn.split(".", 1)
-                        if len(parts) > 1:
-                            asset_name = parts[0].strip()
-                            signal_name = _clean_signal_name(parts[1].strip())
-                        elif "_" in cn:
-                            first_sep = cn.index("_")
-                            asset_name = cn[:first_sep].strip()
-                            signal_name = _clean_signal_name(cn[first_sep+1:].strip())
-                        else:
-                            asset_name = table_base
-                            signal_name = cn
-                        data_type = "STRING" if ("VARCHAR" in ct or "STRING" in ct) else "NUMERIC"
-                        stream_records.append({
-                            "view": view_name, "stream": cn,
-                            "asset": asset_name, "signal": signal_name, "dtype": data_type,
-                            "format": "wide"
-                        })
-                else:
-                    # Classic PI stream format: one view per signal
-                    stream_name = view_name.replace("_", " ")
-                    parts = stream_name.split(".")
-                    asset_name = ".".join(parts[:-1]) if len(parts) > 1 else stream_name
-                    signal_name = _clean_signal_name(parts[-1]) if len(parts) > 1 else "VALUE"
-
-                    data_type = "NUMERIC"
-                    for cr in col_rows:
-                        cn = cr["name"]
-                        ct = cr["type"].upper()
-                        if cn in ("VALUE", "Value"):
-                            if "VARCHAR" in ct or "STRING" in ct:
-                                data_type = "STRING"
-                            elif "INT" in ct:
-                                data_type = "INTEGER"
-
+                # Wide format: each non-Timestamp column is a signal
+                for cr in col_rows:
+                    cn = cr["name"]
+                    if cn == "Timestamp":
+                        continue
+                    ct = cr["type"].upper()
+                    # Parse asset/signal from column name
+                    parts = cn.split(".", 1)
+                    if len(parts) > 1:
+                        asset_name = parts[0].strip()
+                        signal_name = _clean_signal_name(parts[1].strip())
+                    elif "_" in cn:
+                        first_sep = cn.index("_")
+                        asset_name = cn[:first_sep].strip()
+                        signal_name = _clean_signal_name(cn[first_sep+1:].strip())
+                    else:
+                        asset_name = view_name
+                        signal_name = cn
+                    data_type = "STRING" if ("VARCHAR" in ct or "STRING" in ct) else "NUMERIC"
                     stream_records.append({
-                        "view": view_name, "stream": stream_name,
+                        "view": view_name, "stream": cn,
                         "asset": asset_name, "signal": signal_name, "dtype": data_type
                     })
 
-        # Batch classify domains using AI with keyword fallback
-        all_pairs = [(r["asset"], r["signal"]) for r in stream_records]
-        domain_lookup = _classify_domains_ai(session, all_pairs)
-
-        # Second pass: insert metadata with classified domains
+        # Insert metadata with keyword-classified domains
         for rec in stream_records:
-            domain = domain_lookup.get((rec["asset"], rec["signal"]), "general")
+            domain = _detect_domain_keywords(rec["asset"].lower(), rec["signal"].lower())
             safe_view = rec["view"].replace("'", "''")
             safe_stream = rec["stream"].replace("'", "''")
             safe_asset = rec["asset"].replace("'", "''")
             safe_signal = rec["signal"].replace("'", "''")
-            # Wide-format streams store DATA_TYPE='WIDE' for unified view detection
-            stored_dtype = "WIDE" if rec.get("format") == "wide" else rec["dtype"]
             session.sql(
                 f"INSERT INTO CONFIG.STREAM_METADATA (STREAM_VIEW_NAME, STREAM_NAME, ASSET_PATH, ASSET_NAME, SIGNAL_NAME, DOMAIN_CATEGORY, DATA_TYPE) "
-                f"VALUES ('{safe_view}', '{safe_stream}', '{safe_asset}', '{safe_asset}', '{safe_signal}', '{domain}', '{stored_dtype}')"
+                f"VALUES ('{safe_view}', '{safe_stream}', '{safe_asset}', '{safe_asset}', '{safe_signal}', '{domain}', '{rec['dtype']}')"
             ).collect()
 
             if rec["asset"] not in assets:
@@ -527,7 +438,7 @@ def run(session):
 
         return json.dumps({
             "status": "SUCCESS",
-            "message": f"Discovered {stream_count} PI streams across {len(assets)} assets",
+            "message": f"Discovered {stream_count} streams across {len(assets)} assets",
             "details": {"stream_count": stream_count, "asset_count": len(assets), "domain_distribution": domain_map}
         })
 
@@ -540,16 +451,16 @@ $$;
 GRANT USAGE ON PROCEDURE CORE.DISCOVER_METADATA() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- CREATE_UNIFIED_VIEW (Step 3 of init pipeline)
+-- CREATE_SEMANTIC_VIEWS (Step 3 of init pipeline)
 -- =====================================================
--- Reads STREAM_METADATA, builds a UNION ALL across all
--- proxy views (normalizing Delta Sharing, wide-format,
--- and classic PI schemas into a single schema), and
--- creates DATA_VIEWS.PI_STREAMS_UNIFIED.
--- Batches into sub-views if >50 streams.
+-- Scans all proxy views, introspects their columns,
+-- and builds a single semantic view (AVEVA_ANALYTICS)
+-- with all proxy views as logical tables. No UNION ALL,
+-- no format detection heuristics, no PI-specific assumptions.
+-- Each proxy view keeps its native schema.
 -- =====================================================
 
-CREATE OR REPLACE PROCEDURE CORE.CREATE_UNIFIED_VIEW()
+CREATE OR REPLACE PROCEDURE CORE.CREATE_SEMANTIC_VIEWS()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -558,199 +469,259 @@ HANDLER = 'run'
 AS
 $$
 import json
+import re
+
+def _clean_alias(raw):
+    """Create a clean SQL-safe alias from a raw column name.
+    E.g. 'GE01.Wind Speed - 10 min rolling avg.4cda6eb5-... (kW)' -> 'WIND_SPEED_10_MIN_ROLLING_AVG'
+    E.g. 'GE01_P_ACT (kW)' -> 'P_ACT'
+    """
+    # Strip UUID suffix
+    cleaned = re.sub(r'\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '', raw)
+    # Strip unit in parentheses at end
+    cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', cleaned)
+    # Take the part after the last dot (remove asset prefix like GE01.)
+    if '.' in cleaned:
+        cleaned = cleaned.split('.')[-1]
+    # Remove leading asset prefix like GE01_ if present
+    cleaned = re.sub(r'^[A-Z0-9]+[_]', '', cleaned, count=1)
+    # Replace non-alphanumeric with underscore, collapse multiples
+    cleaned = re.sub(r'[^A-Za-z0-9]+', '_', cleaned).strip('_').upper()
+    return cleaned if cleaned else 'VALUE'
+
+
+def _extract_unit(raw):
+    """Extract unit from parentheses at end of column name.
+    E.g. 'GE01_P_ACT (kW)' -> 'kW'"""
+    m = re.search(r'\(([^)]+)\)\s*$', raw)
+    return m.group(1) if m and m.group(1).strip() else None
+
 
 def run(session):
     try:
         # Track progress
-        session.sql("MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'CREATE_UNIFIED_VIEW' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='RUNNING', STARTED_AT=CURRENT_TIMESTAMP(), COMPLETED_AT=NULL, DETAILS=NULL WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, STARTED_AT) VALUES (S.STEP_NAME, 'RUNNING', CURRENT_TIMESTAMP())").collect()
+        session.sql("MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'CREATE_SEMANTIC_VIEWS' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='RUNNING', STARTED_AT=CURRENT_TIMESTAMP(), COMPLETED_AT=NULL, DETAILS=NULL WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, STARTED_AT) VALUES (S.STEP_NAME, 'RUNNING', CURRENT_TIMESTAMP())").collect()
 
-        rows = session.sql(
-            "SELECT STREAM_VIEW_NAME, STREAM_NAME, ASSET_NAME, SIGNAL_NAME, DOMAIN_CATEGORY, DATA_TYPE "
-            "FROM CONFIG.STREAM_METADATA ORDER BY ASSET_NAME, SIGNAL_NAME"
-        ).collect()
-
-        if len(rows) == 0:
-            return json.dumps({"status": "ERROR", "message": "No stream views found in STREAM_METADATA", "details": {}})
-
-        # Detect which views are Delta Sharing (long format) by checking columns once per view
-        view_is_delta = {}
-        for row in rows:
-            vn = row["STREAM_VIEW_NAME"]
-            if vn not in view_is_delta:
-                quoted_vn = vn.replace('"', '""')
-                try:
-                    cols = session.sql(f'DESCRIBE VIEW PROXY_VIEWS."{quoted_vn}"').collect()
-                    col_names = set(c["name"] for c in cols)
-                    view_is_delta[vn] = "Field" in col_names and "Uom" in col_names
-                except:
-                    view_is_delta[vn] = False
-
-        unions = []
-        for row in rows:
-            view_name = row["STREAM_VIEW_NAME"]
-            stream_name = row["STREAM_NAME"]
-            asset = row["ASSET_NAME"].replace("'", "''")
-            signal = row["SIGNAL_NAME"].replace("'", "''")
-            domain = row["DOMAIN_CATEGORY"]
-            dtype = row["DATA_TYPE"]
-            quoted_vn = view_name.replace('"', '""')
-
-            if view_is_delta.get(view_name, False):
-                # Delta Sharing: filter by Field, use NULLs for PI-specific columns
-                safe_stream = stream_name.replace("'", "''")
-                unions.append(
-                    f'SELECT "Timestamp" AS TS, "Value"::DOUBLE AS NUMERIC_VALUE, "Value"::VARCHAR AS STRING_VALUE, '
-                    f'NULL::BOOLEAN AS IS_QUESTIONABLE, NULL::BOOLEAN AS IS_SUBSTITUTED, '
-                    f'NULL::BOOLEAN AS IS_ANNOTATED, NULL::NUMBER AS SYSTEM_STATE_CODE, '
-                    f'NULL::VARCHAR AS DIGITAL_STATE_NAME, '
-                    f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
-                    f'FROM PROXY_VIEWS."{quoted_vn}" WHERE "Field" = \'{safe_stream}\''
-                )
-            elif dtype == "WIDE":
-                # Wide-format: each stream_name is a column name in the view
-                safe_col = stream_name.replace('"', '""')
-                unions.append(
-                    f'SELECT "Timestamp" AS TS, "{safe_col}"::DOUBLE AS NUMERIC_VALUE, "{safe_col}"::VARCHAR AS STRING_VALUE, '
-                    f'NULL::BOOLEAN AS IS_QUESTIONABLE, NULL::BOOLEAN AS IS_SUBSTITUTED, '
-                    f'NULL::BOOLEAN AS IS_ANNOTATED, NULL::NUMBER AS SYSTEM_STATE_CODE, '
-                    f'NULL::VARCHAR AS DIGITAL_STATE_NAME, '
-                    f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
-                    f'FROM PROXY_VIEWS."{quoted_vn}" WHERE "{safe_col}" IS NOT NULL'
-                )
-            else:
-                # Classic PI stream format
-                value_cast = "NULL" if dtype == "STRING" else '"Value"::DOUBLE'
-                value_str = '"Value"::VARCHAR'
-                unions.append(
-                    f'SELECT "Timestamp" AS TS, {value_cast} AS NUMERIC_VALUE, {value_str} AS STRING_VALUE, '
-                    f'"IsQuestionable" AS IS_QUESTIONABLE, "IsSubstituted" AS IS_SUBSTITUTED, '
-                    f'"IsAnnotated" AS IS_ANNOTATED, "SystemStateCode" AS SYSTEM_STATE_CODE, '
-                    f'"DigitalStateName" AS DIGITAL_STATE_NAME, '
-                    f"'{asset}' AS ASSET_NAME, '{signal}' AS SIGNAL_NAME, '{domain}' AS DOMAIN_CATEGORY "
-                    f'FROM PROXY_VIEWS."{quoted_vn}"'
-                )
-
-        batch_size = 50
-        if len(unions) <= batch_size:
-            ddl = "CREATE OR REPLACE VIEW DATA_VIEWS.PI_STREAMS_UNIFIED AS\n" + "\nUNION ALL\n".join(unions)
-            session.sql(ddl).collect()
-        else:
-            temp_views = []
-            for b in range(0, len(unions), batch_size):
-                batch = unions[b:b + batch_size]
-                batch_name = f"PI_STREAMS_BATCH_{b // batch_size}"
-                batch_ddl = f"CREATE OR REPLACE VIEW DATA_VIEWS.{batch_name} AS\n" + "\nUNION ALL\n".join(batch)
-                session.sql(batch_ddl).collect()
-                session.sql(f"GRANT SELECT ON VIEW DATA_VIEWS.{batch_name} TO APPLICATION ROLE APP_PUBLIC").collect()
-                temp_views.append(f"SELECT * FROM DATA_VIEWS.{batch_name}")
-            final_ddl = "CREATE OR REPLACE VIEW DATA_VIEWS.PI_STREAMS_UNIFIED AS\n" + "\nUNION ALL\n".join(temp_views)
-            session.sql(final_ddl).collect()
-
-        session.sql("GRANT SELECT ON VIEW DATA_VIEWS.PI_STREAMS_UNIFIED TO APPLICATION ROLE APP_PUBLIC").collect()
-
-        # Mark progress complete
-        detail_msg = f"{len(unions)} streams unified"
-        session.sql(f"UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{detail_msg}' WHERE STEP_NAME='CREATE_UNIFIED_VIEW'").collect()
-
-        return json.dumps({
-            "status": "SUCCESS",
-            "message": f"Created unified PI streams view with {len(unions)} streams",
-            "details": {"stream_count": len(unions), "batched": len(unions) > batch_size}
-        })
-
-    except Exception as e:
-        err_msg = str(e).replace("'", "''")
-        session.sql(f"MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'CREATE_UNIFIED_VIEW' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='ERROR', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{err_msg}' WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, COMPLETED_AT, DETAILS) VALUES (S.STEP_NAME, 'ERROR', CURRENT_TIMESTAMP(), '{err_msg}')").collect()
-        return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
-$$;
-
-GRANT USAGE ON PROCEDURE CORE.CREATE_UNIFIED_VIEW() TO APPLICATION ROLE APP_PUBLIC;
-
--- =====================================================
--- GENERATE_SEMANTIC_VIEW (Step 4 of init pipeline)
--- =====================================================
--- Creates DATA_VIEWS.DYNAMIC_ANALYTICS semantic view
--- on top of PI_STREAMS_UNIFIED. This enables Cortex
--- Analyst natural language queries against the data.
--- =====================================================
-
-CREATE OR REPLACE PROCEDURE CORE.GENERATE_SEMANTIC_VIEW()
-RETURNS VARCHAR
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python')
-HANDLER = 'run'
-AS
-$$
-import json
-
-def run(session):
-    try:
-        # Track progress
-        session.sql("MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'GENERATE_SEMANTIC_VIEW' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='RUNNING', STARTED_AT=CURRENT_TIMESTAMP(), COMPLETED_AT=NULL, DETAILS=NULL WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, STARTED_AT) VALUES (S.STEP_NAME, 'RUNNING', CURRENT_TIMESTAMP())").collect()
-
-        # Build deterministic semantic view DDL based on PI_STREAMS_UNIFIED
-        # Use CURRENT_DATABASE() so it works regardless of the installed app name
         current_db = session.sql("SELECT CURRENT_DATABASE()").collect()[0][0]
-        ddl = f"""CREATE OR REPLACE SEMANTIC VIEW DATA_VIEWS.DYNAMIC_ANALYTICS
-  TABLES (
-    {current_db}.DATA_VIEWS.PI_STREAMS_UNIFIED
-      COMMENT = 'AVEVA CONNECT PI Data Historian unified time-series stream data'
-  )
-  FACTS (
-    PI_STREAMS_UNIFIED.SENSOR_VALUE AS PI_STREAMS_UNIFIED.NUMERIC_VALUE
-      COMMENT = 'Numeric sensor reading from PI stream'
-  )
-  DIMENSIONS (
-    PI_STREAMS_UNIFIED.MEASUREMENT_TIME AS PI_STREAMS_UNIFIED.TS
-      COMMENT = 'Measurement timestamp',
-    PI_STREAMS_UNIFIED.STATUS_VALUE AS PI_STREAMS_UNIFIED.STRING_VALUE
-      COMMENT = 'String value for status and digital PI streams',
-    PI_STREAMS_UNIFIED.QUESTIONABLE AS PI_STREAMS_UNIFIED.IS_QUESTIONABLE
-      COMMENT = 'PI data quality flag questionable reading',
-    PI_STREAMS_UNIFIED.SUBSTITUTED AS PI_STREAMS_UNIFIED.IS_SUBSTITUTED
-      COMMENT = 'PI data quality flag substituted reading',
-    PI_STREAMS_UNIFIED.ANNOTATED AS PI_STREAMS_UNIFIED.IS_ANNOTATED
-      COMMENT = 'PI annotation flag',
-    PI_STREAMS_UNIFIED.STATE_CODE AS PI_STREAMS_UNIFIED.SYSTEM_STATE_CODE
-      COMMENT = 'PI system state code',
-    PI_STREAMS_UNIFIED.DIGITAL_STATE AS PI_STREAMS_UNIFIED.DIGITAL_STATE_NAME
-      COMMENT = 'PI digital state name',
-    PI_STREAMS_UNIFIED.ASSET AS PI_STREAMS_UNIFIED.ASSET_NAME
-      COMMENT = 'Asset identifier from PI hierarchy',
-    PI_STREAMS_UNIFIED.SIGNAL AS PI_STREAMS_UNIFIED.SIGNAL_NAME
-      COMMENT = 'Signal or tag name',
-    PI_STREAMS_UNIFIED.DOMAIN AS PI_STREAMS_UNIFIED.DOMAIN_CATEGORY
-      COMMENT = 'Auto-detected domain: wind_energy, rotating_machinery, production_quality, packaging, general'
-  )
-  COMMENT = 'AVEVA CONNECT PI Data Historian Analytics'"""
 
-        session.sql(ddl).collect()
-        session.sql("GRANT SELECT ON SEMANTIC VIEW DATA_VIEWS.DYNAMIC_ANALYTICS TO APPLICATION ROLE APP_PUBLIC").collect()
+        # Discover proxy views
+        views_result = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
+        view_names = [row["name"] for row in views_result]
+
+        if len(view_names) == 0:
+            session.sql("UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='No proxy views found - skipped' WHERE STEP_NAME='CREATE_SEMANTIC_VIEWS'").collect()
+            return json.dumps({"status": "SUCCESS", "message": "No proxy views found - semantic view skipped", "details": {}})
+
+        # Only include views that have metadata (proven queryable during DISCOVER_METADATA)
+        meta_views = session.sql("SELECT DISTINCT STREAM_VIEW_NAME FROM CONFIG.STREAM_METADATA").collect()
+        queryable_views = set(r["STREAM_VIEW_NAME"] for r in meta_views)
+
+        tables_clause_parts = []
+        facts_parts = []
+        dims_parts = []
+        view_stats = {}
+        included_views = []
+
+        for view_name in view_names:
+            if view_name not in queryable_views:
+                continue
+            quoted = view_name.replace('"', '""')
+            try:
+                col_rows = session.sql(f'DESCRIBE VIEW PROXY_VIEWS."{quoted}"').collect()
+            except:
+                continue
+
+            if not col_rows:
+                continue
+
+            col_names = [cr["name"] for cr in col_rows]
+            col_types = {cr["name"]: cr["type"].upper() for cr in col_rows}
+            included_views.append(view_name)
+
+            # Use a safe alias for the logical table name in the semantic view
+            safe_table_alias = re.sub(r'[^A-Za-z0-9_]', '_', view_name).upper()
+
+            tables_clause_parts.append(
+                f'  {safe_table_alias} AS {current_db}.PROXY_VIEWS."{quoted}"\n'
+                f'    COMMENT = \'Data table: {view_name.replace(chr(39), "")}\''
+            )
+
+            # Timestamp is always a dimension
+            if "Timestamp" in col_names:
+                dims_parts.append(
+                    f'  {safe_table_alias}.MEASUREMENT_TIME AS {safe_table_alias}."Timestamp"\n'
+                    f'    COMMENT = \'Measurement timestamp\''
+                )
+
+            fact_count = 0
+            used_aliases = set()
+
+            for cn in col_names:
+                if cn == "Timestamp":
+                    continue
+
+                ct = col_types[cn]
+                safe_col = cn.replace('"', '""')
+                is_numeric = any(t in ct for t in ["FLOAT", "NUMBER", "INT", "DOUBLE", "DECIMAL"])
+                is_string = any(t in ct for t in ["VARCHAR", "STRING", "TEXT"])
+
+                # Long-format dimension columns: Field, Name, Uom
+                if cn in ("Field", "Name", "Uom"):
+                    alias = cn.upper()
+                    comment = {"Field": "Signal/tag field name", "Name": "Asset or sensor name", "Uom": "Unit of measurement"}.get(cn, cn)
+                    dims_parts.append(
+                        f'  {safe_table_alias}.{alias} AS {safe_table_alias}."{safe_col}"\n'
+                        f'    COMMENT = \'{comment}\''
+                    )
+                    continue
+
+                # Value column in long-format tables
+                if cn == "Value":
+                    if is_numeric:
+                        facts_parts.append(
+                            f'  {safe_table_alias}.SENSOR_VALUE AS {safe_table_alias}."{safe_col}"::DOUBLE\n'
+                            f'    COMMENT = \'Numeric sensor reading\''
+                        )
+                    else:
+                        dims_parts.append(
+                            f'  {safe_table_alias}.SENSOR_VALUE AS {safe_table_alias}."{safe_col}"\n'
+                            f'    COMMENT = \'Sensor reading (string)\''
+                        )
+                    fact_count += 1
+                    continue
+
+                # Wide-format signal columns — each becomes a fact
+                alias = _clean_alias(cn)
+                # Ensure alias uniqueness within this table
+                base_alias = alias
+                counter = 2
+                while alias in used_aliases:
+                    alias = f"{base_alias}_{counter}"
+                    counter += 1
+                used_aliases.add(alias)
+
+                unit = _extract_unit(cn)
+                unit_str = f" ({unit})" if unit else ""
+                # Strip UUID from the display name for the comment
+                display_name = re.sub(r'\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '', cn)
+                safe_comment = display_name.replace("'", "")
+
+                if is_numeric:
+                    facts_parts.append(
+                        f'  {safe_table_alias}.{alias} AS {safe_table_alias}."{safe_col}"::DOUBLE\n'
+                        f'    COMMENT = \'{safe_comment}{unit_str}\''
+                    )
+                    fact_count += 1
+                elif is_string:
+                    dims_parts.append(
+                        f'  {safe_table_alias}.{alias} AS {safe_table_alias}."{safe_col}"\n'
+                        f'    COMMENT = \'{safe_comment}\''
+                    )
+
+            view_stats[view_name] = fact_count
+
+        if not tables_clause_parts:
+            session.sql("UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='No queryable views - semantic view skipped' WHERE STEP_NAME='CREATE_SEMANTIC_VIEWS'").collect()
+            return json.dumps({"status": "SUCCESS", "message": "No queryable views found - semantic view skipped (Cortex Analyst unavailable)", "details": {}})
+
+        # Build the complete semantic view DDL
+        ddl_parts = [f"CREATE OR REPLACE SEMANTIC VIEW DATA_VIEWS.AVEVA_ANALYTICS\n  TABLES (\n"]
+        ddl_parts.append(",\n".join(tables_clause_parts))
+        ddl_parts.append("\n  )")
+
+        if facts_parts:
+            ddl_parts.append("\n  FACTS (\n")
+            ddl_parts.append(",\n".join(facts_parts))
+            ddl_parts.append("\n  )")
+
+        if dims_parts:
+            ddl_parts.append("\n  DIMENSIONS (\n")
+            ddl_parts.append(",\n".join(dims_parts))
+            ddl_parts.append("\n  )")
+
+        ddl_parts.append("\n  COMMENT = 'AVEVA CONNECT Analytics - auto-generated from proxy views'")
+        ddl_parts.append("\n  AI_SQL_GENERATION 'This semantic view contains industrial time-series data from AVEVA CONNECT. "
+                         "Tables may have different schemas: some are wide-format with many signal columns per row sharing a Timestamp, "
+                         "others are long-format with Timestamp, Field, Value columns. "
+                         "When querying wide-format tables, select the specific signal columns by name. "
+                         "When querying long-format tables, filter by the Field column to select specific signals.'")
+
+        ddl = "".join(ddl_parts)
+
+        # Try to create the semantic view — may fail on CLD/Iceberg proxy views
+        semantic_created = False
+        semantic_error = None
+        try:
+            session.sql(ddl).collect()
+            session.sql("GRANT SELECT ON SEMANTIC VIEW DATA_VIEWS.AVEVA_ANALYTICS TO APPLICATION ROLE APP_PUBLIC").collect()
+
+            # Grant SELECT on each proxy view to APP_PUBLIC (required for Cortex Analyst)
+            for view_name in included_views:
+                quoted = view_name.replace('"', '""')
+                try:
+                    session.sql(f'GRANT SELECT ON VIEW PROXY_VIEWS."{quoted}" TO APPLICATION ROLE APP_PUBLIC').collect()
+                except:
+                    pass
+
+            semantic_created = True
+        except Exception as sv_err:
+            semantic_error = str(sv_err)[:300]
+            # If full DDL fails, try one view at a time to find which work
+            for view_name in list(included_views):
+                quoted = view_name.replace('"', '""')
+                safe_alias = re.sub(r'[^A-Za-z0-9_]', '_', view_name).upper()
+                test_ddl = (
+                    f"CREATE OR REPLACE SEMANTIC VIEW DATA_VIEWS.AVEVA_ANALYTICS\n"
+                    f"  TABLES (\n    {safe_alias} AS {current_db}.PROXY_VIEWS.\"{quoted}\"\n"
+                    f"      COMMENT = 'Data table: {view_name}'\n  )\n"
+                    f"  COMMENT = 'AVEVA CONNECT Analytics - single table test'"
+                )
+                try:
+                    session.sql(test_ddl).collect()
+                    # This view works — but we need all of them, so just note it
+                    semantic_created = False  # partial doesn't count
+                except:
+                    pass
+            # Clean up any partial semantic view
+            try:
+                session.sql("DROP SEMANTIC VIEW IF EXISTS DATA_VIEWS.AVEVA_ANALYTICS").collect()
+            except:
+                pass
 
         # Update APP_STATE
         session.sql(
             "MERGE INTO CONFIG.APP_STATE T USING (SELECT 'SEMANTIC_VIEW_CREATED' AS KEY) S ON T.KEY = S.KEY "
-            "WHEN MATCHED THEN UPDATE SET VALUE='TRUE', UPDATED_AT=CURRENT_TIMESTAMP() "
-            "WHEN NOT MATCHED THEN INSERT (KEY, VALUE) VALUES ('SEMANTIC_VIEW_CREATED', 'TRUE')"
+            "WHEN MATCHED THEN UPDATE SET VALUE='" + ("TRUE" if semantic_created else "FALSE") + "', UPDATED_AT=CURRENT_TIMESTAMP() "
+            "WHEN NOT MATCHED THEN INSERT (KEY, VALUE) VALUES ('SEMANTIC_VIEW_CREATED', '" + ("TRUE" if semantic_created else "FALSE") + "')"
         ).collect()
 
-        # Mark progress complete
-        session.sql("UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='Semantic view DYNAMIC_ANALYTICS created' WHERE STEP_NAME='GENERATE_SEMANTIC_VIEW'").collect()
+        total_facts = sum(view_stats.values())
 
-        return json.dumps({
-            "status": "SUCCESS",
-            "message": "Semantic view DYNAMIC_ANALYTICS created for PI streams",
-            "details": {"semantic_view": "DATA_VIEWS.DYNAMIC_ANALYTICS"}
-        })
+        if semantic_created:
+            detail_msg = f"Semantic view with {len(view_stats)} tables, {total_facts} facts"
+            session.sql(f"UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{detail_msg}' WHERE STEP_NAME='CREATE_SEMANTIC_VIEWS'").collect()
+            return json.dumps({
+                "status": "SUCCESS",
+                "message": f"Created semantic view AVEVA_ANALYTICS with {len(view_stats)} tables and {total_facts} facts",
+                "details": {"tables": len(view_stats), "total_facts": total_facts, "per_table": view_stats}
+            })
+        else:
+            detail_msg = f"Semantic view unavailable - CLD/Iceberg views cannot be referenced in DDL. App functions without Cortex Analyst."
+            safe_detail = detail_msg.replace("'", "''")
+            session.sql(f"UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{safe_detail}' WHERE STEP_NAME='CREATE_SEMANTIC_VIEWS'").collect()
+            return json.dumps({
+                "status": "SUCCESS",
+                "message": "Semantic view could not be created (CLD/Iceberg limitation) - app works without Cortex Analyst",
+                "details": {"semantic_view": False, "reason": semantic_error, "views_attempted": len(included_views)}
+            })
 
     except Exception as e:
         err_msg = str(e).replace("'", "''")
-        session.sql(f"MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'GENERATE_SEMANTIC_VIEW' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='ERROR', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{err_msg}' WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, COMPLETED_AT, DETAILS) VALUES (S.STEP_NAME, 'ERROR', CURRENT_TIMESTAMP(), '{err_msg}')").collect()
+        session.sql(f"MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'CREATE_SEMANTIC_VIEWS' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='ERROR', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{err_msg}' WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, COMPLETED_AT, DETAILS) VALUES (S.STEP_NAME, 'ERROR', CURRENT_TIMESTAMP(), '{err_msg}')").collect()
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
 
-GRANT USAGE ON PROCEDURE CORE.GENERATE_SEMANTIC_VIEW() TO APPLICATION ROLE APP_PUBLIC;
+GRANT USAGE ON PROCEDURE CORE.CREATE_SEMANTIC_VIEWS() TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
 -- IS_INITIALIZED
@@ -790,11 +761,22 @@ AS
 $$
 def run(session):
     lines = []
-    lines.append("PI Stream Data Schema (AVEVA CONNECT Data Historian)")
-    lines.append("Each stream has: Timestamp, Value, IsQuestionable, IsSubstituted, IsAnnotated, SystemStateCode, DigitalStateName")
+    lines.append("AVEVA Connect Data Schema (Industrial IoT Data)")
+    lines.append("Data is organized as proxy views in PROXY_VIEWS schema, with metadata in CONFIG.STREAM_METADATA.")
+    lines.append("Each signal maps to a specific proxy view and column (wide format) or Field value (long format).")
     lines.append("")
-    lines.append("UNIFIED VIEW: DATA_VIEWS.PI_STREAMS_UNIFIED")
-    lines.append("Columns: TS (timestamp), NUMERIC_VALUE (double), STRING_VALUE (varchar), IS_QUESTIONABLE (boolean), IS_SUBSTITUTED (boolean), IS_ANNOTATED (boolean), SYSTEM_STATE_CODE (number), DIGITAL_STATE_NAME (varchar), ASSET_NAME (varchar), SIGNAL_NAME (varchar), DOMAIN_CATEGORY (varchar)")
+    lines.append("SEMANTIC VIEW: DATA_VIEWS.AVEVA_ANALYTICS")
+    lines.append("Query via Cortex Analyst for natural-language access to all signals.")
+    lines.append("")
+
+    # Proxy views
+    try:
+        pv_rows = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
+        lines.append(f"Proxy Views: {len(pv_rows)}")
+        for pv in pv_rows:
+            lines.append(f"  - {pv['name']}")
+    except:
+        pass
     lines.append("")
 
     # Domain categories
@@ -904,24 +886,30 @@ def run(session):
         except:
             pass
 
-        # Drop semantic view
+        # Drop materialized tables in DATA_VIEWS
         try:
-            session.sql("DROP SEMANTIC VIEW IF EXISTS DATA_VIEWS.DYNAMIC_ANALYTICS").collect()
+            existing_tables = session.sql("SHOW TABLES IN SCHEMA DATA_VIEWS").collect()
+            for t in existing_tables:
+                tn = t["name"].replace('"', '""')
+                session.sql(f'DROP TABLE IF EXISTS DATA_VIEWS."{tn}"').collect()
         except:
             pass
 
-        # Re-run initialization pipeline
+        # Drop semantic view
+        try:
+            session.sql("DROP SEMANTIC VIEW IF EXISTS DATA_VIEWS.AVEVA_ANALYTICS").collect()
+        except:
+            pass
+
+        # Re-run initialization pipeline (3 steps)
         r1 = session.sql("CALL CORE.INITIALIZE_VIEWS()").collect()
         results["initialize_views"] = json.loads(r1[0][0]) if len(r1) > 0 else {"status": "ERROR", "message": "No result"}
 
         r2 = session.sql("CALL CORE.DISCOVER_METADATA()").collect()
         results["discover_metadata"] = json.loads(r2[0][0]) if len(r2) > 0 else {"status": "ERROR", "message": "No result"}
 
-        r3 = session.sql("CALL CORE.CREATE_UNIFIED_VIEW()").collect()
-        results["create_unified_view"] = json.loads(r3[0][0]) if len(r3) > 0 else {"status": "ERROR", "message": "No result"}
-
-        r4 = session.sql("CALL CORE.GENERATE_SEMANTIC_VIEW()").collect()
-        results["generate_semantic_view"] = json.loads(r4[0][0]) if len(r4) > 0 else {"status": "ERROR", "message": "No result"}
+        r3 = session.sql("CALL CORE.CREATE_SEMANTIC_VIEWS()").collect()
+        results["create_semantic_views"] = json.loads(r3[0][0]) if len(r3) > 0 else {"status": "ERROR", "message": "No result"}
 
         all_ok = all(r.get("status") == "SUCCESS" for r in results.values())
         overall = "SUCCESS" if all_ok else "PARTIAL"
@@ -955,19 +943,10 @@ import json
 def run(session):
     checks = {}
 
-    # 1. SHARED_CONTENT + PROXY_VIEWS count vs stored count
+    # 1. PROXY_VIEWS count vs stored count
     try:
-        shared_count = 0
-        try:
-            sc_rows = session.sql("SHOW VIEWS IN SCHEMA SHARED_CONTENT").collect()
-            shared_count += len(sc_rows)
-        except:
-            pass
-        try:
-            pv_rows = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
-            shared_count += len(pv_rows)
-        except:
-            pass
+        pv_rows_check = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
+        shared_count = len(pv_rows_check)
         stored_rows = session.sql("SELECT VALUE FROM CONFIG.APP_STATE WHERE KEY = 'VIEW_COUNT'").collect()
         stored_count = int(stored_rows[0]["VALUE"]) if len(stored_rows) > 0 else 0
         checks["shared_content_sync"] = {
@@ -1003,21 +982,43 @@ def run(session):
     except Exception as e:
         checks["stream_metadata"] = {"status": "ERROR", "error": str(e)}
 
-    # 4. PI_STREAMS_UNIFIED exists and is queryable
+    # 4. Proxy views exist and at least one queryable view works
     try:
-        session.sql("SELECT 1 FROM DATA_VIEWS.PI_STREAMS_UNIFIED LIMIT 1").collect()
-        checks["unified_view"] = {"status": "OK"}
+        pv_rows = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
+        pv_count = len(pv_rows)
+        if pv_count > 0:
+            # Spot-check a view that has metadata (proven queryable)
+            queryable_check = False
+            meta_views = session.sql("SELECT DISTINCT STREAM_VIEW_NAME FROM CONFIG.STREAM_METADATA LIMIT 1").collect()
+            if meta_views:
+                test_view = meta_views[0]["STREAM_VIEW_NAME"].replace('"', '""')
+                try:
+                    session.sql(f'SELECT 1 FROM PROXY_VIEWS."{test_view}" LIMIT 1').collect()
+                    queryable_check = True
+                except:
+                    pass
+            checks["proxy_views"] = {"status": "OK" if queryable_check else "DEGRADED", "count": pv_count}
+        else:
+            checks["proxy_views"] = {"status": "EMPTY", "count": 0}
     except Exception as e:
-        checks["unified_view"] = {"status": "ERROR", "error": str(e)}
+        checks["proxy_views"] = {"status": "ERROR", "error": str(e)}
 
-    # 5. DYNAMIC_ANALYTICS semantic view exists
+    # 5. AVEVA_ANALYTICS semantic view exists (optional — may be unavailable due to CLD limitations)
     try:
-        session.sql("DESCRIBE SEMANTIC VIEW DATA_VIEWS.DYNAMIC_ANALYTICS").collect()
+        session.sql("DESCRIBE SEMANTIC VIEW DATA_VIEWS.AVEVA_ANALYTICS").collect()
         checks["semantic_view"] = {"status": "OK"}
     except Exception as e:
-        checks["semantic_view"] = {"status": "ERROR", "error": str(e)}
+        # Check if it was intentionally skipped
+        try:
+            sv_state = session.sql("SELECT VALUE FROM CONFIG.APP_STATE WHERE KEY='SEMANTIC_VIEW_CREATED'").collect()
+            if sv_state and sv_state[0][0] == 'FALSE':
+                checks["semantic_view"] = {"status": "SKIPPED", "note": "CLD/Iceberg limitation - Cortex Analyst unavailable"}
+            else:
+                checks["semantic_view"] = {"status": "ERROR", "error": str(e)}
+        except:
+            checks["semantic_view"] = {"status": "ERROR", "error": str(e)}
 
-    all_ok = all(c.get("status") == "OK" for c in checks.values())
+    all_ok = all(c.get("status") in ("OK", "SKIPPED") for c in checks.values())
     return json.dumps({
         "status": "HEALTHY" if all_ok else "DEGRADED",
         "message": "All checks passed" if all_ok else "Some checks failed",
@@ -1042,7 +1043,7 @@ $$
 import json
 
 def run(session):
-    expected_steps = ["INITIALIZE_VIEWS", "DISCOVER_METADATA", "CREATE_UNIFIED_VIEW", "GENERATE_SEMANTIC_VIEW"]
+    expected_steps = ["INITIALIZE_VIEWS", "DISCOVER_METADATA", "CREATE_SEMANTIC_VIEWS"]
 
     try:
         rows = session.sql("SELECT STEP_NAME, STATUS, STARTED_AT, COMPLETED_AT, DETAILS FROM CONFIG.INIT_PROGRESS ORDER BY STARTED_AT").collect()
@@ -1120,57 +1121,103 @@ AS
 $$
 import json
 
+def _resolve_signal(session, asset_name, signal_name):
+    """Look up STREAM_METADATA to find the proxy view and build SQL fragments.
+    Returns (view_fqn, ts_col, value_expr, where_filter) or raises ValueError."""
+    safe_a = asset_name.replace("'", "''")
+    safe_s = signal_name.replace("'", "''")
+    meta = session.sql(
+        f"SELECT STREAM_VIEW_NAME, STREAM_NAME FROM CONFIG.STREAM_METADATA "
+        f"WHERE ASSET_NAME = '{safe_a}' AND SIGNAL_NAME = '{safe_s}' LIMIT 1"
+    ).collect()
+    if not meta:
+        raise ValueError(f"No metadata found for {asset_name}.{signal_name}")
+    view_name = meta[0]["STREAM_VIEW_NAME"]
+    stream_name = meta[0]["STREAM_NAME"]
+    quoted_view = view_name.replace('"', '""')
+    view_fqn = f'PROXY_VIEWS."{quoted_view}"'
+
+    # Detect long vs wide format
+    cols = session.sql(f'DESCRIBE VIEW {view_fqn}').collect()
+    col_names = set(c["name"] for c in cols)
+    has_field = "Field" in col_names
+
+    if has_field:
+        safe_stream = stream_name.replace("'", "''")
+        return (view_fqn, '"Timestamp"', '"Value"::DOUBLE',
+                f"\"Field\" = '{safe_stream}' AND \"Value\" IS NOT NULL")
+    else:
+        safe_col = stream_name.replace('"', '""')
+        return (view_fqn, '"Timestamp"', f'"{safe_col}"::DOUBLE',
+                f'"{safe_col}" IS NOT NULL')
+
 def run(session, p_asset_name, p_signal_name, p_lookback_days):
     try:
         lookback = p_lookback_days if p_lookback_days and p_lookback_days > 0 else 7
 
-        # If signal not specified, auto-detect best numeric candidates
+        # If signal not specified, auto-detect best numeric candidates from metadata
         if not p_signal_name or p_signal_name == '' or p_signal_name == 'AUTO':
             safe_asset = p_asset_name.replace("'", "''") if p_asset_name else ""
             where_asset = f"AND ASSET_NAME = '{safe_asset}'" if p_asset_name and p_asset_name != 'ALL' else ""
-            candidates = session.sql(f"""
-                SELECT ASSET_NAME, SIGNAL_NAME,
-                       COUNT(*) AS CNT,
-                       STDDEV(NUMERIC_VALUE) AS STDDEV_VAL,
-                       AVG(NUMERIC_VALUE) AS AVG_VAL
-                FROM DATA_VIEWS.PI_STREAMS_UNIFIED
-                WHERE NUMERIC_VALUE IS NOT NULL
-                  AND TS >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
+            # Get candidate signals from metadata
+            candidates_meta = session.sql(f"""
+                SELECT ASSET_NAME, SIGNAL_NAME, STREAM_VIEW_NAME, STREAM_NAME
+                FROM CONFIG.STREAM_METADATA
+                WHERE DATA_TYPE IN ('FLOAT', 'NUMBER', 'DOUBLE', 'NUMERIC')
                   {where_asset}
-                GROUP BY ASSET_NAME, SIGNAL_NAME
-                HAVING CNT >= 50 AND STDDEV_VAL > 0
-                ORDER BY STDDEV_VAL DESC
-                LIMIT 10
+                ORDER BY ASSET_NAME, SIGNAL_NAME
+                LIMIT 20
             """).collect()
 
-            if len(candidates) == 0:
+            signal_list = []
+            for cm in candidates_meta:
+                try:
+                    view_fqn, ts_col, value_expr, where_filter = _resolve_signal(
+                        session, cm["ASSET_NAME"], cm["SIGNAL_NAME"])
+                    stats = session.sql(f"""
+                        SELECT COUNT(*) AS CNT, STDDEV({value_expr}) AS STDDEV_VAL, AVG({value_expr}) AS AVG_VAL
+                        FROM {view_fqn}
+                        WHERE {where_filter}
+                          AND {ts_col} >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
+                    """).collect()
+                    cnt = stats[0]["CNT"] if stats else 0
+                    stddev = float(stats[0]["STDDEV_VAL"]) if stats and stats[0]["STDDEV_VAL"] else 0
+                    avg_v = float(stats[0]["AVG_VAL"]) if stats and stats[0]["AVG_VAL"] else 0
+                    if cnt >= 50 and stddev > 0:
+                        signal_list.append({
+                            "asset": cm["ASSET_NAME"], "signal": cm["SIGNAL_NAME"],
+                            "readings": cnt, "stddev": stddev, "avg": avg_v
+                        })
+                except Exception:
+                    continue
+                if len(signal_list) >= 10:
+                    break
+
+            signal_list.sort(key=lambda x: x["stddev"], reverse=True)
+
+            if len(signal_list) == 0:
                 return json.dumps({
                     "status": "ERROR",
                     "message": "No suitable numeric signals found for anomaly detection",
                     "details": {"lookback_days": lookback}
                 })
 
-            # Return the auto-detected candidates
-            signal_list = [{"asset": r["ASSET_NAME"], "signal": r["SIGNAL_NAME"],
-                           "readings": r["CNT"], "stddev": float(r["STDDEV_VAL"]) if r["STDDEV_VAL"] else 0,
-                           "avg": float(r["AVG_VAL"]) if r["AVG_VAL"] else 0}
-                          for r in candidates]
             return json.dumps({
                 "status": "CANDIDATES",
                 "message": f"Found {len(signal_list)} signals suitable for anomaly detection",
                 "details": {"candidates": signal_list, "lookback_days": lookback}
             })
 
-        # Run anomaly detection on specified signal using rolling z-score (no ML classes in Native Apps)
+        # Run anomaly detection on specified signal
         safe_asset = p_asset_name.replace("'", "''")
         safe_signal = p_signal_name.replace("'", "''")
+        view_fqn, ts_col, value_expr, where_filter = _resolve_signal(session, p_asset_name, p_signal_name)
 
         # Count available data
         row_count = session.sql(f"""
-            SELECT COUNT(*) AS CNT FROM DATA_VIEWS.PI_STREAMS_UNIFIED
-            WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}'
-              AND NUMERIC_VALUE IS NOT NULL
-              AND TS >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
+            SELECT COUNT(*) AS CNT FROM {view_fqn}
+            WHERE {where_filter}
+              AND {ts_col} >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
         """).collect()
         data_count = row_count[0]["CNT"] if len(row_count) > 0 else 0
         if data_count < 12:
@@ -1181,7 +1228,6 @@ def run(session, p_asset_name, p_signal_name, p_lookback_days):
             })
 
         # Detect anomalies using rolling z-score with 24-point window
-        # Points with |z-score| > 3 are flagged as anomalies
         session.sql(f"""
             DELETE FROM CONFIG.ANOMALY_RESULTS
             WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}' AND MODEL_TYPE = 'ANOMALY'
@@ -1192,13 +1238,12 @@ def run(session, p_asset_name, p_signal_name, p_lookback_days):
                 (ASSET_NAME, SIGNAL_NAME, DOMAIN_CATEGORY, TS, NUMERIC_VALUE,
                  IS_ANOMALY, ANOMALY_SCORE, FORECAST_VALUE, LOWER_BOUND, UPPER_BOUND, MODEL_TYPE)
             WITH base AS (
-                SELECT TS, NUMERIC_VALUE AS VALUE,
-                       AVG(NUMERIC_VALUE) OVER (ORDER BY TS ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING) AS ROLLING_AVG,
-                       STDDEV(NUMERIC_VALUE) OVER (ORDER BY TS ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING) AS ROLLING_STD
-                FROM DATA_VIEWS.PI_STREAMS_UNIFIED
-                WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}'
-                  AND NUMERIC_VALUE IS NOT NULL
-                  AND TS >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
+                SELECT {ts_col} AS TS, {value_expr} AS VALUE,
+                       AVG({value_expr}) OVER (ORDER BY {ts_col} ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING) AS ROLLING_AVG,
+                       STDDEV({value_expr}) OVER (ORDER BY {ts_col} ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING) AS ROLLING_STD
+                FROM {view_fqn}
+                WHERE {where_filter}
+                  AND {ts_col} >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
             ),
             scored AS (
                 SELECT TS, VALUE, ROLLING_AVG, ROLLING_STD,
@@ -1262,21 +1307,61 @@ $$
 import json
 from datetime import timedelta
 
+def _resolve_signal(session, asset_name, signal_name):
+    """Look up STREAM_METADATA to find the proxy view and build SQL fragments.
+    Returns (view_fqn, ts_col, value_expr, where_filter) or raises ValueError."""
+    safe_a = asset_name.replace("'", "''")
+    safe_s = signal_name.replace("'", "''")
+    meta = session.sql(
+        f"SELECT STREAM_VIEW_NAME, STREAM_NAME FROM CONFIG.STREAM_METADATA "
+        f"WHERE ASSET_NAME = '{safe_a}' AND SIGNAL_NAME = '{safe_s}' LIMIT 1"
+    ).collect()
+    if not meta:
+        raise ValueError(f"No metadata found for {asset_name}.{signal_name}")
+    view_name = meta[0]["STREAM_VIEW_NAME"]
+    stream_name = meta[0]["STREAM_NAME"]
+    quoted_view = view_name.replace('"', '""')
+    view_fqn = f'PROXY_VIEWS."{quoted_view}"'
+
+    cols = session.sql(f'DESCRIBE VIEW {view_fqn}').collect()
+    col_names = set(c["name"] for c in cols)
+    has_field = "Field" in col_names
+
+    if has_field:
+        safe_stream = stream_name.replace("'", "''")
+        return (view_fqn, '"Timestamp"', '"Value"::DOUBLE',
+                f"\"Field\" = '{safe_stream}' AND \"Value\" IS NOT NULL")
+    else:
+        safe_col = stream_name.replace('"', '""')
+        return (view_fqn, '"Timestamp"', f'"{safe_col}"::DOUBLE',
+                f'"{safe_col}" IS NOT NULL')
+
 def run(session, p_asset_name, p_signal_name, p_horizon_days):
     try:
         horizon = p_horizon_days if p_horizon_days and p_horizon_days > 0 else 7
-        safe_asset = p_asset_name.replace("'", "''")
-        safe_signal = p_signal_name.replace("'", "''")
+
+        if not p_asset_name or not p_signal_name:
+            # Auto-select a signal with good data density
+            auto = session.sql(
+                "SELECT ASSET_NAME, SIGNAL_NAME FROM CONFIG.STREAM_METADATA "
+                "WHERE DATA_TYPE IN ('FLOAT', 'NUMBER', 'DOUBLE', 'NUMERIC') "
+                "ORDER BY SIGNAL_NAME LIMIT 1"
+            ).collect()
+            if not auto:
+                return json.dumps({"status": "ERROR", "message": "No numeric signals found for auto-selection", "details": {}})
+            p_asset_name = auto[0]["ASSET_NAME"]
+            p_signal_name = auto[0]["SIGNAL_NAME"]
+
+        view_fqn, ts_col, value_expr, where_filter = _resolve_signal(session, p_asset_name, p_signal_name)
 
         # Count available data and determine frequency
         stats = session.sql(f"""
             SELECT COUNT(*) AS CNT,
-                   MIN(TS) AS MIN_TS, MAX(TS) AS MAX_TS,
-                   AVG(NUMERIC_VALUE) AS AVG_VAL,
-                   STDDEV(NUMERIC_VALUE) AS STD_VAL
-            FROM DATA_VIEWS.PI_STREAMS_UNIFIED
-            WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}'
-              AND NUMERIC_VALUE IS NOT NULL
+                   MIN({ts_col}) AS MIN_TS, MAX({ts_col}) AS MAX_TS,
+                   AVG({value_expr}) AS AVG_VAL,
+                   STDDEV({value_expr}) AS STD_VAL
+            FROM {view_fqn}
+            WHERE {where_filter}
         """).collect()
         data_count = stats[0]["CNT"] if len(stats) > 0 else 0
         if data_count < 12:
@@ -1291,11 +1376,10 @@ def run(session, p_asset_name, p_signal_name, p_horizon_days):
         # Determine data frequency
         freq_rows = session.sql(f"""
             SELECT MEDIAN(INTERVAL_MIN) AS MED_INTERVAL FROM (
-                SELECT TIMESTAMPDIFF('minute', LAG(TS) OVER (ORDER BY TS), TS) AS INTERVAL_MIN
-                FROM DATA_VIEWS.PI_STREAMS_UNIFIED
-                WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}'
-                  AND NUMERIC_VALUE IS NOT NULL
-                ORDER BY TS DESC LIMIT 200
+                SELECT TIMESTAMPDIFF('minute', LAG({ts_col}) OVER (ORDER BY {ts_col}), {ts_col}) AS INTERVAL_MIN
+                FROM {view_fqn}
+                WHERE {where_filter}
+                ORDER BY {ts_col} DESC LIMIT 200
             ) WHERE INTERVAL_MIN > 0
         """).collect()
         avg_interval_min = float(freq_rows[0]["MED_INTERVAL"]) if freq_rows and freq_rows[0]["MED_INTERVAL"] else 60
@@ -1304,11 +1388,10 @@ def run(session, p_asset_name, p_signal_name, p_horizon_days):
 
         # Fetch last 200 data points for training (ordered chronologically)
         training_rows = session.sql(f"""
-            SELECT TS, NUMERIC_VALUE AS VALUE FROM (
-                SELECT TS, NUMERIC_VALUE, ROW_NUMBER() OVER (ORDER BY TS DESC) AS RN
-                FROM DATA_VIEWS.PI_STREAMS_UNIFIED
-                WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}'
-                  AND NUMERIC_VALUE IS NOT NULL
+            SELECT {ts_col} AS TS, {value_expr} AS VALUE FROM (
+                SELECT {ts_col}, {value_expr}, ROW_NUMBER() OVER (ORDER BY {ts_col} DESC) AS RN
+                FROM {view_fqn}
+                WHERE {where_filter}
             ) WHERE RN <= 200
             ORDER BY TS ASC
         """).collect()

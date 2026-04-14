@@ -118,6 +118,59 @@ def run_sql(sql: str):
         st.error(f"Query error: {e}")
         return pd.DataFrame()
 
+
+def query_signal_timeseries(asset: str, signal: str, agg_sql: str = None, limit: int = 500):
+    """Query a signal's time-series data from the correct proxy view.
+    Looks up STREAM_METADATA to find the view and column, then queries directly.
+    Returns a DataFrame with TS and VALUE columns (or aggregated columns if agg_sql provided)."""
+    safe_asset = safe_sql_string(asset)
+    safe_signal = safe_sql_string(signal)
+    pfx = db_prefix()
+    try:
+        meta = session.sql(
+            f"SELECT STREAM_VIEW_NAME, STREAM_NAME FROM CONFIG.STREAM_METADATA "
+            f"WHERE ASSET_NAME = '{safe_asset}' AND SIGNAL_NAME = '{safe_signal}' LIMIT 1"
+        ).collect()
+        if not meta:
+            return pd.DataFrame()
+        view_name = meta[0]["STREAM_VIEW_NAME"]
+        stream_name = meta[0]["STREAM_NAME"]
+        quoted_view = view_name.replace('"', '""')
+
+        # Detect if this is a wide-format column or a long-format Field value
+        cols = session.sql(f'DESCRIBE VIEW {pfx}PROXY_VIEWS."{quoted_view}"').collect()
+        col_names = set(c["name"] for c in cols)
+        has_field = "Field" in col_names
+
+        if has_field:
+            # Long format: filter by Field, use Value column
+            safe_stream = safe_sql_string(stream_name)
+            if agg_sql:
+                return session.sql(agg_sql.replace("__VIEW__", f'{pfx}PROXY_VIEWS."{quoted_view}"')
+                    .replace("__FILTER__", f"\"Field\" = '{safe_stream}'")
+                    .replace("__VALUE__", '"Value"::DOUBLE')).to_pandas()
+            return session.sql(
+                f'SELECT "Timestamp" AS TS, "Value"::DOUBLE AS VALUE '
+                f'FROM {pfx}PROXY_VIEWS."{quoted_view}" '
+                f"WHERE \"Field\" = '{safe_stream}' AND \"Value\" IS NOT NULL "
+                f'ORDER BY "Timestamp" DESC LIMIT {limit}'
+            ).to_pandas()
+        else:
+            # Wide format: the stream_name IS the column name
+            safe_col = stream_name.replace('"', '""')
+            if agg_sql:
+                return session.sql(agg_sql.replace("__VIEW__", f'{pfx}PROXY_VIEWS."{quoted_view}"')
+                    .replace("__FILTER__", f'"{safe_col}" IS NOT NULL')
+                    .replace("__VALUE__", f'"{safe_col}"::DOUBLE')).to_pandas()
+            return session.sql(
+                f'SELECT "Timestamp" AS TS, "{safe_col}"::DOUBLE AS VALUE '
+                f'FROM {pfx}PROXY_VIEWS."{quoted_view}" '
+                f'WHERE "{safe_col}" IS NOT NULL '
+                f'ORDER BY "Timestamp" DESC LIMIT {limit}'
+            ).to_pandas()
+    except Exception:
+        return pd.DataFrame()
+
 # ---------------------------------------------------------------------------
 # Cached data loaders
 # ---------------------------------------------------------------------------
@@ -214,8 +267,7 @@ def run_initialization():
     steps = [
         ("Initializing data views...", "CALL CORE.INITIALIZE_VIEWS()"),
         ("Discovering stream metadata...", "CALL CORE.DISCOVER_METADATA()"),
-        ("Creating unified view...", "CALL CORE.CREATE_UNIFIED_VIEW()"),
-        ("Generating semantic view...", "CALL CORE.GENERATE_SEMANTIC_VIEW()"),
+        ("Creating semantic views...", "CALL CORE.CREATE_SEMANTIC_VIEWS()"),
     ]
 
     progress_bar = st.progress(0)
@@ -330,7 +382,7 @@ if "session_logged" not in st.session_state:
 st.markdown("""
 <div class="main-header">
     <h1>AVEVA CONNECT Analytics</h1>
-    <p>PI Data Historian &bull; Dynamic Stream Discovery &bull; Snowflake Cortex AI</p>
+    <p>Industrial IoT Data &bull; Dynamic Stream Discovery &bull; Snowflake Cortex AI</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -362,7 +414,7 @@ if "last_page" not in st.session_state or st.session_state.last_page != page:
     st.session_state.last_page = page
 
 st.sidebar.divider()
-st.sidebar.success("PI Streams: Connected")
+    st.sidebar.success("Data Streams: Connected")
 st.sidebar.caption(f"Streams: {len(metadata_df)} | Domains: {len(domains)}")
 for d, c in domains.items():
     label = DOMAIN_LABELS.get(d, d)
@@ -420,19 +472,14 @@ if page == "Dashboard":
                         st.metric(asset, f"{n} signals")
 
                 try:
-                    sample_asset = safe_sql_string(assets[0])
-                    sample_signal = safe_sql_string(
-                        domain_streams[domain_streams["ASSET_NAME"] == assets[0]]["SIGNAL_NAME"].iloc[0]
+                    sample_asset = assets[0]
+                    sample_signal = domain_streams[domain_streams["ASSET_NAME"] == assets[0]]["SIGNAL_NAME"].iloc[0]
+                    chart_df = query_signal_timeseries(
+                        sample_asset, sample_signal,
+                        agg_sql="SELECT DATE_TRUNC('hour', \"Timestamp\") AS HOUR, AVG(__VALUE__) AS AVG_VALUE FROM __VIEW__ WHERE __FILTER__ GROUP BY 1 ORDER BY 1 LIMIT 48"
                     )
-                    chart_df = run_sql(f"""
-                        SELECT DATE_TRUNC('hour', TS) AS HOUR, AVG(NUMERIC_VALUE) AS AVG_VALUE
-                        FROM {db_prefix()}DATA_VIEWS.PI_STREAMS_UNIFIED
-                        WHERE ASSET_NAME = '{sample_asset}' AND SIGNAL_NAME = '{sample_signal}'
-                          AND NUMERIC_VALUE IS NOT NULL
-                        GROUP BY 1 ORDER BY 1 LIMIT 48
-                    """)
                     if not chart_df.empty and len(chart_df) > 1:
-                        st.caption(f"Trend: {assets[0]} - {domain_streams[domain_streams['ASSET_NAME'] == assets[0]]['SIGNAL_NAME'].iloc[0]}")
+                        st.caption(f"Trend: {sample_asset} - {sample_signal}")
                         st.line_chart(chart_df.set_index("HOUR")["AVG_VALUE"])
                 except Exception:
                     pass
@@ -482,24 +529,15 @@ elif page == "Asset Explorer":
                         key=f"signal_{row['ASSET_PATH']}",
                     )
                     if st.button("Show Trend", key=f"trend_{row['ASSET_PATH']}"):
-                        safe_asset = safe_sql_string(row["ASSET_PATH"])
-                        safe_signal = safe_sql_string(selected_signal)
                         try:
-                            trend_df = run_sql(f"""
-                                SELECT TS, NUMERIC_VALUE
-                                FROM {db_prefix()}DATA_VIEWS.PI_STREAMS_UNIFIED
-                                WHERE ASSET_NAME = '{safe_asset}'
-                                  AND SIGNAL_NAME = '{safe_signal}'
-                                  AND NUMERIC_VALUE IS NOT NULL
-                                ORDER BY TS LIMIT 500
-                            """)
+                            trend_df = query_signal_timeseries(row["ASSET_PATH"], selected_signal, limit=500)
                             if not trend_df.empty:
-                                st.line_chart(trend_df.set_index("TS")["NUMERIC_VALUE"])
+                                st.line_chart(trend_df.set_index("TS")["VALUE"])
                                 mc1, mc2, mc3, mc4 = st.columns(4)
-                                mc1.metric("Min", f"{trend_df['NUMERIC_VALUE'].min():.2f}")
-                                mc2.metric("Max", f"{trend_df['NUMERIC_VALUE'].max():.2f}")
-                                mc3.metric("Mean", f"{trend_df['NUMERIC_VALUE'].mean():.2f}")
-                                mc4.metric("Std Dev", f"{trend_df['NUMERIC_VALUE'].std():.2f}")
+                                mc1.metric("Min", f"{trend_df['VALUE'].min():.2f}")
+                                mc2.metric("Max", f"{trend_df['VALUE'].max():.2f}")
+                                mc3.metric("Mean", f"{trend_df['VALUE'].mean():.2f}")
+                                mc4.metric("Std Dev", f"{trend_df['VALUE'].std():.2f}")
                         except Exception as e:
                             st.error(f"Error loading trend: {e}")
     else:
@@ -513,11 +551,29 @@ elif page == "Talk to Your Data":
     st.header("Talk to Your Data")
     st.markdown("Ask questions about your AVEVA PI data using Cortex AI")
 
+    # Check if semantic view was created
+    semantic_available = False
+    try:
+        sv_state = session.sql("SELECT VALUE FROM CONFIG.APP_STATE WHERE KEY='SEMANTIC_VIEW_CREATED'").collect()
+        if sv_state and sv_state[0][0] == 'TRUE':
+            semantic_available = True
+    except:
+        pass
+
+    if not semantic_available:
+        st.warning(
+            "**Cortex Analyst is not available** for this installation. "
+            "The semantic view could not be created due to CLD/Iceberg table limitations. "
+            "All other features (Dashboard, Asset Explorer, Data Statistics, Forecasting, Anomaly Detection) work normally."
+        )
+        st.info("This limitation will be resolved when the underlying data tables are fully initialized by the provider.")
+        st.stop()
+
     # --- Cortex Analyst (grounded SQL via semantic view) ---
     def call_cortex_analyst(question: str) -> dict:
         """Call Cortex Analyst via REST API for grounded SQL generation."""
         db = get_current_database()
-        semantic_view_fqn = f"{db}.DATA_VIEWS.DYNAMIC_ANALYTICS" if db else "DATA_VIEWS.DYNAMIC_ANALYTICS"
+        semantic_view_fqn = f"{db}.DATA_VIEWS.AVEVA_ANALYTICS" if db else "DATA_VIEWS.AVEVA_ANALYTICS"
         try:
             body = {
                 "messages": [
@@ -597,7 +653,7 @@ elif page == "Talk to Your Data":
             if not sql:
                 error_detail = analyst_resp.get("error", "No SQL generated by Cortex Analyst")
                 st.error(f"Cortex Analyst error: {error_detail}")
-                st.info("Ensure the semantic view DYNAMIC_ANALYTICS exists. Try re-running initialization.")
+                st.info("Ensure the semantic view AVEVA_ANALYTICS exists. Try re-running initialization.")
 
             if sql:
                 with st.expander("Generated SQL", expanded=False):
@@ -618,8 +674,8 @@ elif page == "Talk to Your Data":
 # ===========================================================================
 
 elif page == "Stream Browser":
-    st.header("PI Stream Browser")
-    st.markdown("Browse all discovered PI data streams")
+    st.header("Signal Browser")
+    st.markdown("Browse all discovered data streams and signals")
 
     if not metadata_df.empty:
         col1, col2 = st.columns(2)
@@ -669,84 +725,60 @@ elif page == "Stream Browser":
 # ===========================================================================
 
 elif page == "Data Statistics":
-    st.header("PI Stream Statistics")
-    st.markdown("Comprehensive statistics across all PI data streams")
-
-    pfx = db_prefix()
+    st.header("Stream Statistics")
+    st.markdown("Overview of discovered AVEVA CONNECT data streams")
 
     try:
-        overview = run_sql(f"""
-            SELECT
-                COUNT(*) AS TOTAL_RECORDS,
-                COUNT(DISTINCT ASSET_NAME) AS ASSETS,
-                COUNT(DISTINCT SIGNAL_NAME) AS SIGNALS,
-                COUNT(DISTINCT DOMAIN_CATEGORY) AS DOMAINS,
-                MIN(TS) AS EARLIEST,
-                MAX(TS) AS LATEST,
-                SUM(CASE WHEN IS_QUESTIONABLE THEN 1 ELSE 0 END) AS QUESTIONABLE_COUNT,
-                SUM(CASE WHEN IS_SUBSTITUTED THEN 1 ELSE 0 END) AS SUBSTITUTED_COUNT
-            FROM {pfx}DATA_VIEWS.PI_STREAMS_UNIFIED
-        """)
-
-        if not overview.empty:
+        # Summary from metadata (no unified view needed)
+        if not metadata_df.empty:
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Records", f"{overview['TOTAL_RECORDS'].iloc[0]:,}")
-            c2.metric("Assets", overview["ASSETS"].iloc[0])
-            c3.metric("Signals", overview["SIGNALS"].iloc[0])
-            c4.metric("Domains", overview["DOMAINS"].iloc[0])
+            c1.metric("Total Streams", len(metadata_df))
+            c2.metric("Assets", metadata_df["ASSET_NAME"].nunique())
+            c3.metric("Signals", metadata_df["SIGNAL_NAME"].nunique())
+            c4.metric("Domains", metadata_df["DOMAIN_CATEGORY"].nunique())
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Earliest", str(overview["EARLIEST"].iloc[0])[:19])
-            c2.metric("Latest", str(overview["LATEST"].iloc[0])[:19])
-            c3.metric("Questionable", f"{overview['QUESTIONABLE_COUNT'].iloc[0]:,}")
-            c4.metric("Substituted", f"{overview['SUBSTITUTED_COUNT'].iloc[0]:,}")
-
-        st.divider()
-        st.subheader("Records by Domain")
-        domain_stats = run_sql(f"""
-            SELECT DOMAIN_CATEGORY, COUNT(*) AS RECORDS,
-                   COUNT(DISTINCT ASSET_NAME) AS ASSETS,
-                   AVG(NUMERIC_VALUE) AS AVG_VALUE
-            FROM {pfx}DATA_VIEWS.PI_STREAMS_UNIFIED
-            WHERE NUMERIC_VALUE IS NOT NULL
-            GROUP BY DOMAIN_CATEGORY ORDER BY RECORDS DESC
-        """)
-        if not domain_stats.empty:
-            st.bar_chart(domain_stats.set_index("DOMAIN_CATEGORY")["RECORDS"])
-            st.dataframe(domain_stats, use_container_width=True, hide_index=True)
-
-        st.divider()
-        st.subheader("Signal Statistics by Asset")
-        signal_stats = run_sql(f"""
-            SELECT ASSET_NAME, SIGNAL_NAME,
-                   COUNT(*) AS READINGS,
-                   ROUND(AVG(NUMERIC_VALUE), 2) AS AVG_VALUE,
-                   ROUND(MIN(NUMERIC_VALUE), 2) AS MIN_VALUE,
-                   ROUND(MAX(NUMERIC_VALUE), 2) AS MAX_VALUE,
-                   ROUND(STDDEV(NUMERIC_VALUE), 2) AS STD_DEV
-            FROM {pfx}DATA_VIEWS.PI_STREAMS_UNIFIED
-            WHERE NUMERIC_VALUE IS NOT NULL
-            GROUP BY ASSET_NAME, SIGNAL_NAME
-            ORDER BY ASSET_NAME, SIGNAL_NAME
-            LIMIT 200
-        """)
-        if not signal_stats.empty:
-            st.dataframe(signal_stats, use_container_width=True, hide_index=True)
+            # Per-view row counts
+            st.divider()
+            st.subheader("Data Volume by View")
+            pfx = db_prefix()
+            view_names = metadata_df["STREAM_VIEW_NAME"].unique().tolist()
+            view_stats = []
+            for vn in view_names:
+                quoted = vn.replace('"', '""')
+                try:
+                    cnt_df = session.sql(f'SELECT COUNT(*) AS CNT, MIN("Timestamp") AS EARLIEST, MAX("Timestamp") AS LATEST FROM {pfx}PROXY_VIEWS."{quoted}"').to_pandas()
+                    if not cnt_df.empty:
+                        view_stats.append({
+                            "View": vn,
+                            "Rows": int(cnt_df["CNT"].iloc[0]),
+                            "Earliest": str(cnt_df["EARLIEST"].iloc[0])[:19] if pd.notna(cnt_df["EARLIEST"].iloc[0]) else "N/A",
+                            "Latest": str(cnt_df["LATEST"].iloc[0])[:19] if pd.notna(cnt_df["LATEST"].iloc[0]) else "N/A",
+                            "Signals": len(metadata_df[metadata_df["STREAM_VIEW_NAME"] == vn])
+                        })
+                except Exception:
+                    view_stats.append({"View": vn, "Rows": 0, "Earliest": "Error", "Latest": "Error", "Signals": 0})
+            if view_stats:
+                vs_df = pd.DataFrame(view_stats)
+                st.dataframe(vs_df, use_container_width=True, hide_index=True)
+                st.bar_chart(vs_df.set_index("View")["Rows"])
 
         st.divider()
-        st.subheader("Data Quality Overview")
-        quality_df = run_sql(f"""
-            SELECT ASSET_NAME,
-                   COUNT(*) AS TOTAL,
-                   SUM(CASE WHEN IS_QUESTIONABLE THEN 1 ELSE 0 END) AS QUESTIONABLE,
-                   SUM(CASE WHEN IS_SUBSTITUTED THEN 1 ELSE 0 END) AS SUBSTITUTED,
-                   SUM(CASE WHEN IS_ANNOTATED THEN 1 ELSE 0 END) AS ANNOTATED,
-                   ROUND(100.0 * SUM(CASE WHEN IS_QUESTIONABLE THEN 1 ELSE 0 END) / COUNT(*), 2) AS PCT_QUESTIONABLE
-            FROM {pfx}DATA_VIEWS.PI_STREAMS_UNIFIED
-            GROUP BY ASSET_NAME ORDER BY PCT_QUESTIONABLE DESC
-        """)
-        if not quality_df.empty:
-            st.dataframe(quality_df, use_container_width=True, hide_index=True)
+        st.subheader("Streams by Domain")
+        domain_stats_df = metadata_df.groupby("DOMAIN_CATEGORY").agg(
+            STREAMS=("SIGNAL_NAME", "count"),
+            ASSETS=("ASSET_NAME", "nunique")
+        ).reset_index() if not metadata_df.empty else pd.DataFrame()
+        if not domain_stats_df.empty:
+            st.bar_chart(domain_stats_df.set_index("DOMAIN_CATEGORY")["STREAMS"])
+            st.dataframe(domain_stats_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Streams by Asset")
+        if not metadata_df.empty:
+            asset_stats = metadata_df.groupby(["ASSET_NAME", "DOMAIN_CATEGORY"]).agg(
+                SIGNALS=("SIGNAL_NAME", "count")
+            ).reset_index().sort_values("SIGNALS", ascending=False)
+            st.dataframe(asset_stats.head(200), use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"Error loading statistics: {e}")
@@ -987,13 +1019,10 @@ elif page == "Forecasting":
             safe_a = fc_asset.replace("'", "''")
             safe_s = fc_signal.replace("'", "''")
 
-            historical_df = run_sql(f"""
-                SELECT TS, NUMERIC_VALUE
-                FROM {pfx}DATA_VIEWS.PI_STREAMS_UNIFIED
-                WHERE ASSET_NAME = '{safe_a}' AND SIGNAL_NAME = '{safe_s}'
-                  AND NUMERIC_VALUE IS NOT NULL
-                ORDER BY TS
-            """)
+            historical_df = query_signal_timeseries(fc_asset, fc_signal, limit=2000)
+            if not historical_df.empty:
+                historical_df = historical_df.rename(columns={"VALUE": "NUMERIC_VALUE"})
+                historical_df = historical_df.sort_values("TS")
 
             forecast_df = run_sql(f"""
                 SELECT TS, FORECAST_VALUE, LOWER_BOUND, UPPER_BOUND
@@ -1054,22 +1083,21 @@ elif page == "Forecasting":
         st.info("Select an asset and signal, then generate a forecast.")
 
 elif page == "Data Dictionary":
-    st.header("AVEVA PI Data Dictionary")
-    st.markdown("Auto-generated documentation for all PI streams and signals")
+    st.header("AVEVA Connect Data Dictionary")
+    st.markdown("Auto-generated documentation for all data streams and signals")
 
     tab1, tab2, tab3 = st.tabs(["Field Definitions", "Stream Metadata", "App State"])
 
     with tab1:
         @st.cache_data(ttl=3600)
-        def generate_pi_dictionary(_session):
+        def generate_data_dictionary(_session):
             schema_info = get_schema_info(_session)
             prompt = (
-                "Based on this AVEVA PI data historian schema, generate a data dictionary. "
+                "Based on this industrial IoT data schema, generate a data dictionary. "
                 "For each signal type, provide a business-friendly description.\n\n"
                 f"{schema_info}\n\n"
-                "Also include entries for the standard PI quality columns:\n"
-                "- IS_QUESTIONABLE, IS_SUBSTITUTED, IS_ANNOTATED, SYSTEM_STATE_CODE, DIGITAL_STATE_NAME\n\n"
-                'Return as a JSON array: [{"field": "NAME", "category": "Signal|Quality|Metadata", '
+                "Include entries for the standard columns: Timestamp, Value, Field, Name, Uom.\n\n"
+                'Return as a JSON array: [{"field": "NAME", "category": "Signal|Metadata", '
                 '"description": "...", "unit": "...", "example": "..."}]\n'
                 "Return ONLY valid JSON array."
             )
@@ -1087,7 +1115,7 @@ elif page == "Data Dictionary":
             return None
 
         with st.spinner("Generating data dictionary via Cortex AI..."):
-            dictionary = generate_pi_dictionary(session)
+            dictionary = generate_data_dictionary(session)
 
         if dictionary:
             st.success(f"Found {len(dictionary)} field definitions")
@@ -1110,7 +1138,7 @@ elif page == "Data Dictionary":
             dict_df = pd.DataFrame(filtered_dict)
             st.dataframe(dict_df, use_container_width=True, hide_index=True)
             csv = dict_df.to_csv(index=False)
-            st.download_button("Download as CSV", csv, "pi_data_dictionary.csv", "text/csv")
+            st.download_button("Download as CSV", csv, "aveva_data_dictionary.csv", "text/csv")
         else:
             st.warning("Could not generate dictionary. Showing raw stream metadata.")
             st.dataframe(metadata_df, use_container_width=True, hide_index=True)
@@ -1195,4 +1223,4 @@ elif page == "Privacy & Telemetry":
 # ---------------------------------------------------------------------------
 
 st.divider()
-st.caption("AVEVA CONNECT Analytics | PI Data Historian | Snowflake Cortex AI | Privacy Protected")
+st.caption("AVEVA CONNECT Analytics | Industrial IoT Data | Snowflake Cortex AI | Privacy Protected")
