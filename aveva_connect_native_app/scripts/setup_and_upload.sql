@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS AVEVA_CONNECT.ADMIN.CUSTOMERS (
     STATUS                VARCHAR DEFAULT 'PENDING',
     CREATED_AT            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
     UPDATED_AT            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    NOTES                 VARCHAR
+    NOTES                 VARCHAR,
+    TABLES_BUNDLED        VARCHAR,
+    TABLES_NOT_BUNDLED    VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS AVEVA_CONNECT.ADMIN.ACCOUNT_MAPPING (
@@ -63,6 +65,16 @@ CREATE TABLE IF NOT EXISTS AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (
     STATUS          VARCHAR NOT NULL,
     MESSAGE         VARCHAR,
     EXECUTED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE TABLE IF NOT EXISTS AVEVA_CONNECT.ADMIN.CUSTOMER_TABLES (
+    TABLE_ID        VARCHAR DEFAULT UUID_STRING() PRIMARY KEY,
+    CUSTOMER_NAME   VARCHAR NOT NULL,
+    TABLE_NAME      VARCHAR NOT NULL,
+    TABLE_SCHEMA    VARCHAR,
+    STATUS          VARCHAR NOT NULL,
+    ERROR_MESSAGE   VARCHAR,
+    CREATED_AT      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
 -- Seed default configurations (idempotent)
@@ -194,6 +206,11 @@ DECLARE
     v_proxy_count     INTEGER DEFAULT 0;
     v_table_count     INTEGER DEFAULT 0;
     v_retry           INTEGER DEFAULT 0;
+    v_sub_log         VARCHAR DEFAULT '';
+    v_sub_err         VARCHAR;
+    v_proxy_errors    VARCHAR DEFAULT '';
+    v_bundled_list    VARCHAR DEFAULT '';
+    v_not_bundled_list VARCHAR DEFAULT '';
 BEGIN
 
     -- Load defaults
@@ -215,22 +232,35 @@ BEGIN
     v_stage_schema := SUBSTR(:v_app_stage, 1, LENGTH(:v_app_stage) - LENGTH(SPLIT_PART(:v_app_stage, '.', -1)) - 1);
     v_short_account := SPLIT_PART(:P_CUSTOMER_ACCOUNT, '.', -1);
 
+    INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
+        VALUES (:P_CUSTOMER_NAME, 0, 'Init', 'INFO', 'pkg=' || :v_app_pkg || ' ver=' || :v_app_version || ' stage=' || :v_app_stage || ' dist=' || :v_dist_mode || ' cld=' || :v_cld_db || ' listing=' || :v_listing_name || ' account=' || :P_CUSTOMER_ACCOUNT);
+
     -- STEP 1: App Package (IF NOT EXISTS)
     BEGIN
+        v_sub_log := '';
         EXECUTE IMMEDIATE 'CREATE APPLICATION PACKAGE IF NOT EXISTS ' || :v_app_pkg;
+        v_sub_log := 'pkg_ok';
         EXECUTE IMMEDIATE 'CREATE SCHEMA IF NOT EXISTS ' || :v_stage_schema;
+        v_sub_log := v_sub_log || ',schema_ok';
         EXECUTE IMMEDIATE 'CREATE STAGE IF NOT EXISTS ' || :v_app_stage ||
             ' DIRECTORY = (ENABLE = TRUE) ENCRYPTION = (TYPE = ''SNOWFLAKE_SSE'')';
+        v_sub_log := v_sub_log || ',stage_ok';
 
         -- Register version (REGISTER for release channels, ADD as fallback)
         BEGIN
             EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
                 ' REGISTER VERSION ' || :v_app_version || ' USING ''@' || :v_app_stage || '''';
+            v_sub_log := v_sub_log || ',register_ver_ok';
         EXCEPTION WHEN OTHER THEN
+            v_sub_err := SQLERRM;
+            v_sub_log := v_sub_log || ',register_ver_err(' || :v_sub_err || ')';
             BEGIN
                 EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
                     ' ADD VERSION ' || :v_app_version || ' USING ''@' || :v_app_stage || '''';
-            EXCEPTION WHEN OTHER THEN NULL;
+                v_sub_log := v_sub_log || ',add_ver_ok';
+            EXCEPTION WHEN OTHER THEN
+                v_sub_err := SQLERRM;
+                v_sub_log := v_sub_log || ',add_ver_err(' || :v_sub_err || ')';
             END;
         END;
 
@@ -238,33 +268,43 @@ BEGIN
         BEGIN
             EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
                 ' MODIFY RELEASE CHANNEL DEFAULT ADD VERSION ' || :v_app_version;
-        EXCEPTION WHEN OTHER THEN NULL;
+            v_sub_log := v_sub_log || ',release_ch_add_ok';
+        EXCEPTION WHEN OTHER THEN
+            v_sub_err := SQLERRM;
+            v_sub_log := v_sub_log || ',release_ch_add_err(' || :v_sub_err || ')';
         END;
 
         -- Set release directive (with release channel fallback)
         BEGIN
             EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
                 ' MODIFY RELEASE CHANNEL DEFAULT SET DEFAULT RELEASE DIRECTIVE VERSION = ' || :v_app_version || ' PATCH = 0';
+            v_sub_log := v_sub_log || ',release_dir_ok';
         EXCEPTION WHEN OTHER THEN
+            v_sub_err := SQLERRM;
+            v_sub_log := v_sub_log || ',release_dir_err(' || :v_sub_err || ')';
             BEGIN
                 EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg ||
                     ' SET DEFAULT RELEASE DIRECTIVE VERSION = ' || :v_app_version || ' PATCH = 0';
-            EXCEPTION WHEN OTHER THEN NULL;
+                v_sub_log := v_sub_log || ',legacy_dir_ok';
+            EXCEPTION WHEN OTHER THEN
+                v_sub_err := SQLERRM;
+                v_sub_log := v_sub_log || ',legacy_dir_err(' || :v_sub_err || ')';
             END;
         END;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 1, 'App Package & Version', 'SUCCESS', 'Package: ' || :v_app_pkg);
+            VALUES (:P_CUSTOMER_NAME, 1, 'App Package & Version', 'SUCCESS', :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 1, 'App Package & Version', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 1, 'App Package & Version', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 1 FAILED: ' || :v_err || '\n';
     END;
 
     -- STEP 2: Catalog Integration (Delta Sharing IRC)
     BEGIN
+        v_sub_log := 'catalog_uri=' || :P_CATALOG_URI || ',warehouse_id=' || :P_WAREHOUSE_ID;
         EXECUTE IMMEDIATE
             'CREATE OR REPLACE CATALOG INTEGRATION ' || :v_catalog_int ||
             ' CATALOG_SOURCE = ICEBERG_REST TABLE_FORMAT = ICEBERG' ||
@@ -273,50 +313,60 @@ BEGIN
             ''' ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS)' ||
             ' REST_AUTHENTICATION = (TYPE = BEARER BEARER_TOKEN = ''' || :P_BEARER_TOKEN ||
             ''') ENABLED = TRUE REFRESH_INTERVAL_SECONDS = 30';
+        v_sub_log := v_sub_log || ',create_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 2, 'Catalog Integration', 'SUCCESS', 'Created: ' || :v_catalog_int);
+            VALUES (:P_CUSTOMER_NAME, 2, 'Catalog Integration', 'SUCCESS', :v_catalog_int || ' | ' || :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 2, 'Catalog Integration', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 2, 'Catalog Integration', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 2 FAILED: ' || :v_err || '\n';
     END;
 
     -- STEP 3: Catalog-Linked Database
     BEGIN
+        v_sub_log := 'cld=' || :v_cld_db || ',catalog=' || :v_catalog_int;
         EXECUTE IMMEDIATE
             'CREATE OR REPLACE DATABASE ' || :v_cld_db ||
             ' LINKED_CATALOG = (CATALOG = ''' || :v_catalog_int ||
             ''' SYNC_INTERVAL_SECONDS = 300 NAMESPACE_MODE = FLATTEN_NESTED_NAMESPACE NAMESPACE_FLATTEN_DELIMITER = ''/'')';
+        v_sub_log := v_sub_log || ',create_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 3, 'Catalog-Linked Database', 'SUCCESS', 'Created: ' || :v_cld_db);
+            VALUES (:P_CUSTOMER_NAME, 3, 'Catalog-Linked Database', 'SUCCESS', :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 3, 'Catalog-Linked Database', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 3, 'Catalog-Linked Database', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 3 FAILED: ' || :v_err || '\n';
     END;
 
     -- STEP 4: Share Data
     BEGIN
+        v_sub_log := '';
         EXECUTE IMMEDIATE 'CREATE SCHEMA IF NOT EXISTS ' || :v_app_pkg || '.SHARED_CONTENT';
+        v_sub_log := 'shared_schema_ok';
         EXECUTE IMMEDIATE 'GRANT USAGE ON SCHEMA ' || :v_app_pkg || '.SHARED_CONTENT TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
+        v_sub_log := v_sub_log || ',grant_usage_ok';
         BEGIN
             EXECUTE IMMEDIATE 'GRANT REFERENCE_USAGE ON DATABASE ' || :v_cld_db || ' TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
-        EXCEPTION WHEN OTHER THEN NULL;
+            v_sub_log := v_sub_log || ',ref_usage_cld_ok';
+        EXCEPTION WHEN OTHER THEN
+            v_sub_err := SQLERRM;
+            v_sub_log := v_sub_log || ',ref_usage_cld_err(' || :v_sub_err || ')';
         END;
         EXECUTE IMMEDIATE 'GRANT REFERENCE_USAGE ON DATABASE AVEVA_CONNECT TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
+        v_sub_log := v_sub_log || ',ref_usage_admin_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 4, 'Share Data', 'SUCCESS', 'REFERENCE_USAGE granted');
+            VALUES (:P_CUSTOMER_NAME, 4, 'Share Data', 'SUCCESS', :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 4, 'Share Data', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 4, 'Share Data', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 4 FAILED: ' || :v_err || '\n';
     END;
@@ -327,8 +377,12 @@ BEGIN
     -- setup.sql can discover them via SHOW VIEWS IN SCHEMA PROXY_VIEWS.
     -- CLD tables take time to sync from Delta Sharing — wait up to 90s.
     BEGIN
+        v_sub_log := '';
+        v_proxy_errors := '';
         EXECUTE IMMEDIATE 'CREATE SCHEMA IF NOT EXISTS ' || :v_app_pkg || '.PROXY_VIEWS';
+        v_sub_log := 'proxy_schema_ok';
         EXECUTE IMMEDIATE 'GRANT USAGE ON SCHEMA ' || :v_app_pkg || '.PROXY_VIEWS TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
+        v_sub_log := v_sub_log || ',grant_usage_ok';
 
         -- Wait for CLD tables to sync (up to 90 seconds, polling every 10s)
         v_table_count := 0;
@@ -341,6 +395,13 @@ BEGIN
                 v_retry := v_retry + 1;
             END IF;
         END WHILE;
+        v_sub_log := v_sub_log || ',waited=' || :v_retry * 10 || 's,tables_found=' || :v_table_count;
+
+        -- Log if no tables found after waiting
+        IF (:v_table_count = 0) THEN
+            INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
+                VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'WARNING', 'No CLD tables found after 90s wait. CLD=' || :v_cld_db);
+        END IF;
 
         -- Create proxy views for discovered tables
         EXECUTE IMMEDIATE 'SHOW TABLES IN DATABASE ' || :v_cld_db;
@@ -349,57 +410,101 @@ BEGIN
             FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
         OPEN c1;
         v_proxy_count := 0;
+        v_bundled_list := '';
+        v_not_bundled_list := '';
         FOR rec IN c1 DO
             BEGIN
                 EXECUTE IMMEDIATE 'CREATE OR REPLACE SECURE VIEW ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '" AS SELECT * FROM ' || :v_cld_db || '."' || rec.TABLE_SCHEMA || '"."' || rec.TABLE_NAME || '"';
                 EXECUTE IMMEDIATE 'GRANT SELECT ON VIEW ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '" TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
                 v_proxy_count := v_proxy_count + 1;
-            EXCEPTION WHEN OTHER THEN NULL;
+                -- Record as BUNDLED
+                EXECUTE IMMEDIATE
+                    'INSERT INTO AVEVA_CONNECT.ADMIN.CUSTOMER_TABLES (CUSTOMER_NAME, TABLE_NAME, TABLE_SCHEMA, STATUS) VALUES (''' || :P_CUSTOMER_NAME || ''', ''' || rec.TABLE_NAME || ''', ''' || rec.TABLE_SCHEMA || ''', ''BUNDLED'')';
+                IF (LENGTH(:v_bundled_list) > 0) THEN
+                    v_bundled_list := v_bundled_list || ',' || rec.TABLE_NAME;
+                ELSE
+                    v_bundled_list := rec.TABLE_NAME;
+                END IF;
+            EXCEPTION WHEN OTHER THEN
+                v_sub_err := SQLERRM;
+                v_proxy_errors := v_proxy_errors || rec.TABLE_NAME || ':' || :v_sub_err || '; ';
+                -- Record as NOT_BUNDLED
+                EXECUTE IMMEDIATE
+                    'INSERT INTO AVEVA_CONNECT.ADMIN.CUSTOMER_TABLES (CUSTOMER_NAME, TABLE_NAME, TABLE_SCHEMA, STATUS, ERROR_MESSAGE) VALUES (''' || :P_CUSTOMER_NAME || ''', ''' || rec.TABLE_NAME || ''', ''' || rec.TABLE_SCHEMA || ''', ''NOT_BUNDLED'', ''' || REPLACE(:v_sub_err, '''', '''''') || ''')';
+                IF (LENGTH(:v_not_bundled_list) > 0) THEN
+                    v_not_bundled_list := v_not_bundled_list || ',' || rec.TABLE_NAME;
+                ELSE
+                    v_not_bundled_list := rec.TABLE_NAME;
+                END IF;
             END;
         END FOR;
         CLOSE c1;
 
-        INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'SUCCESS', :v_proxy_count || ' proxy views created (waited ' || :v_retry * 10 || 's for CLD sync)');
-        v_steps_ok := v_steps_ok + 1;
+        v_sub_log := v_sub_log || ',proxy_created=' || :v_proxy_count || ',bundled=' || :v_bundled_list || ',not_bundled=' || :v_not_bundled_list;
+        IF (LENGTH(:v_proxy_errors) > 0) THEN
+            v_sub_log := v_sub_log || ',proxy_errors=' || :v_proxy_errors;
+        END IF;
+
+        IF (:v_proxy_count = 0) THEN
+            INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
+                VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'FAILED', '0 bundled | ' || :v_sub_log);
+            v_steps_failed := v_steps_failed + 1;
+            v_result := v_result || 'STEP 5 FAILED: 0 tables bundled. Errors: ' || :v_proxy_errors || '\n';
+        ELSE
+            INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
+                VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'SUCCESS', :v_proxy_count || ' bundled | ' || :v_sub_log);
+            v_steps_ok := v_steps_ok + 1;
+            IF (LENGTH(:v_not_bundled_list) > 0) THEN
+                v_result := v_result || 'STEP 5 WARNING: ' || :v_proxy_count || ' bundled, not bundled: ' || :v_not_bundled_list || '\n';
+            END IF;
+        END IF;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'FAILED', 'sub_log=' || :v_sub_log || ',proxy_errors=' || :v_proxy_errors || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 5 FAILED: ' || :v_err || '\n';
     END;
 
     -- STEP 6: Account Mapping (idempotent)
     BEGIN
+        v_sub_log := '';
         EXECUTE IMMEDIATE
             'INSERT INTO AVEVA_CONNECT.ADMIN.ACCOUNT_MAPPING (SNOWFLAKE_ACCOUNT, VIEW_PATTERN)
              SELECT ''' || :P_CUSTOMER_ACCOUNT || ''', ''' || :v_view_pattern || '''
              WHERE NOT EXISTS (SELECT 1 FROM AVEVA_CONNECT.ADMIN.ACCOUNT_MAPPING WHERE SNOWFLAKE_ACCOUNT = ''' || :P_CUSTOMER_ACCOUNT || ''')';
+        v_sub_log := 'mapping_insert_ok';
         EXECUTE IMMEDIATE
             'CREATE OR REPLACE SECURE VIEW ' || :v_app_pkg || '.SHARED_CONTENT.ACCOUNT_VIEW_MAP AS SELECT SNOWFLAKE_ACCOUNT, VIEW_PATTERN FROM AVEVA_CONNECT.ADMIN.ACCOUNT_MAPPING';
+        v_sub_log := v_sub_log || ',view_ok';
         EXECUTE IMMEDIATE
             'GRANT SELECT ON VIEW ' || :v_app_pkg || '.SHARED_CONTENT.ACCOUNT_VIEW_MAP TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
+        v_sub_log := v_sub_log || ',grant_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 6, 'Account Mapping', 'SUCCESS', 'Mapped ' || :P_CUSTOMER_ACCOUNT);
+            VALUES (:P_CUSTOMER_NAME, 6, 'Account Mapping', 'SUCCESS', 'account=' || :P_CUSTOMER_ACCOUNT || ',' || :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 6, 'Account Mapping', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 6, 'Account Mapping', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 6 FAILED: ' || :v_err || '\n';
     END;
 
     -- STEP 7: Listing
     BEGIN
+        v_sub_log := 'dist_mode=' || :v_dist_mode;
         BEGIN
             IF (:v_dist_mode = 'ORGANIZATION') THEN
                 EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg || ' SET DISTRIBUTION = ''INTERNAL''';
+                v_sub_log := v_sub_log || ',set_internal_ok';
             ELSE
                 EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg || ' SET DISTRIBUTION = ''EXTERNAL''';
+                v_sub_log := v_sub_log || ',set_external_ok';
             END IF;
-        EXCEPTION WHEN OTHER THEN NULL;
+        EXCEPTION WHEN OTHER THEN
+            v_sub_err := SQLERRM;
+            v_sub_log := v_sub_log || ',set_dist_err(' || :v_sub_err || ')';
         END;
 
         IF (:v_dist_mode = 'ORGANIZATION') THEN
@@ -421,10 +526,14 @@ BEGIN
                 ' APPLICATION PACKAGE ' || :v_app_pkg ||
                 ' AS ''' || REPLACE(:v_listing_yaml, '''', '''''') || '''' ||
                 ' PUBLISH = FALSE REVIEW = FALSE';
+            v_sub_log := v_sub_log || ',yaml_org_target=' || :v_short_account;
         ELSE
             BEGIN
                 EXECUTE IMMEDIATE 'ALTER APPLICATION PACKAGE ' || :v_app_pkg || ' ADD TARGET ACCOUNTS = (''' || :P_CUSTOMER_ACCOUNT || ''')';
-            EXCEPTION WHEN OTHER THEN NULL;
+                v_sub_log := v_sub_log || ',add_target_ok';
+            EXCEPTION WHEN OTHER THEN
+                v_sub_err := SQLERRM;
+                v_sub_log := v_sub_log || ',add_target_err(' || :v_sub_err || ')';
             END;
             v_listing_yaml := 'title: "' || :v_listing_title || '"' || CHR(10) ||
                 'subtitle: "' || :v_subtitle || '"' || CHR(10) ||
@@ -442,34 +551,43 @@ BEGIN
                 ' APPLICATION PACKAGE ' || :v_app_pkg ||
                 ' AS ''' || REPLACE(:v_listing_yaml, '''', '''''') || '''' ||
                 ' PUBLISH = FALSE REVIEW = FALSE';
+            v_sub_log := v_sub_log || ',yaml_ext_target=' || :P_CUSTOMER_ACCOUNT;
         END IF;
+
+        v_sub_log := v_sub_log || ',listing_sql_len=' || LENGTH(:v_listing_sql);
         EXECUTE IMMEDIATE :v_listing_sql;
+        v_sub_log := v_sub_log || ',create_listing_ok';
         EXECUTE IMMEDIATE 'ALTER LISTING ' || :v_listing_name || ' PUBLISH';
+        v_sub_log := v_sub_log || ',publish_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 7, 'Listing', 'SUCCESS', 'Published: ' || :v_listing_name);
+            VALUES (:P_CUSTOMER_NAME, 7, 'Listing', 'SUCCESS', :v_listing_name || ' | ' || :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 7, 'Listing', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 7, 'Listing', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 7 FAILED: ' || :v_err || '\n';
     END;
 
     -- STEP 8: Register Customer (idempotent)
     BEGIN
+        v_sub_log := '';
         EXECUTE IMMEDIATE
-            'INSERT INTO AVEVA_CONNECT.ADMIN.CUSTOMERS (CUSTOMER_NAME, SNOWFLAKE_ACCOUNT_ID, STATUS, NOTES)
+            'INSERT INTO AVEVA_CONNECT.ADMIN.CUSTOMERS (CUSTOMER_NAME, SNOWFLAKE_ACCOUNT_ID, STATUS, NOTES, TABLES_BUNDLED, TABLES_NOT_BUNDLED)
              SELECT ''' || :P_CUSTOMER_NAME || ''', ''' || :P_CUSTOMER_ACCOUNT || ''', ''ACTIVE'',
-                    ''Onboarded via proc. Distribution: ' || :v_dist_mode || '.''
+                    ''Onboarded via proc. Distribution: ' || :v_dist_mode || '.'',
+                    ''' || REPLACE(:v_bundled_list, '''', '''''') || ''',
+                    ''' || REPLACE(:v_not_bundled_list, '''', '''''') || '''
              WHERE NOT EXISTS (SELECT 1 FROM AVEVA_CONNECT.ADMIN.CUSTOMERS WHERE SNOWFLAKE_ACCOUNT_ID = ''' || :P_CUSTOMER_ACCOUNT || ''')';
+        v_sub_log := 'customer_insert_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 8, 'Register Customer', 'SUCCESS', 'Done');
+            VALUES (:P_CUSTOMER_NAME, 8, 'Register Customer', 'SUCCESS', :v_sub_log || ',dist=' || :v_dist_mode);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 8, 'Register Customer', 'FAILED', :v_err);
+            VALUES (:P_CUSTOMER_NAME, 8, 'Register Customer', 'FAILED', 'sub_log=' || :v_sub_log || ' | err=' || :v_err);
         v_steps_failed := v_steps_failed + 1;
         v_result := v_result || 'STEP 8 FAILED: ' || :v_err || '\n';
     END;
