@@ -414,7 +414,7 @@ if "last_page" not in st.session_state or st.session_state.last_page != page:
     st.session_state.last_page = page
 
 st.sidebar.divider()
-    st.sidebar.success("Data Streams: Connected")
+st.sidebar.success("Data Streams: Connected")
 st.sidebar.caption(f"Streams: {len(metadata_df)} | Domains: {len(domains)}")
 for d, c in domains.items():
     label = DOMAIN_LABELS.get(d, d)
