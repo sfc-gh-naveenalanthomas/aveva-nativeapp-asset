@@ -504,6 +504,11 @@ def run(session):
 
         current_db = session.sql("SELECT CURRENT_DATABASE()").collect()[0][0]
 
+        # Use the installed app database name as prefix — Cortex Analyst needs to
+        # resolve tables through the consumer's installed app context, not the
+        # app package. CURRENT_DATABASE() returns the app name (e.g. AVEVA_CONNECT_POLARIS2_TEST).
+        proxy_prefix = f"{current_db}.PROXY_VIEWS"
+
         # Discover proxy views
         views_result = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
         view_names = [row["name"] for row in views_result]
@@ -542,7 +547,7 @@ def run(session):
             safe_table_alias = re.sub(r'[^A-Za-z0-9_]', '_', view_name).upper()
 
             tables_clause_parts.append(
-                f'  {safe_table_alias} AS {current_db}.PROXY_VIEWS."{quoted}"\n'
+                f'  {safe_table_alias} AS {proxy_prefix}.\"{quoted}\"\n'
                 f'    COMMENT = \'Data table: {view_name.replace(chr(39), "")}\''
             )
 
@@ -672,7 +677,7 @@ def run(session):
                 safe_alias = re.sub(r'[^A-Za-z0-9_]', '_', view_name).upper()
                 test_ddl = (
                     f"CREATE OR REPLACE SEMANTIC VIEW DATA_VIEWS.AVEVA_ANALYTICS\n"
-                    f"  TABLES (\n    {safe_alias} AS {current_db}.PROXY_VIEWS.\"{quoted}\"\n"
+                    f"  TABLES (\n    {safe_alias} AS {proxy_prefix}.\"{quoted}\"\n"
                     f"      COMMENT = 'Data table: {view_name}'\n  )\n"
                     f"  COMMENT = 'AVEVA CONNECT Analytics - single table test'"
                 )

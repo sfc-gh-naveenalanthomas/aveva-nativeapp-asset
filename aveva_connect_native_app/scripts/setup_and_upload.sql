@@ -149,12 +149,28 @@ LIST @AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE;
 -- =============================================================================
 -- STEP 4: Register Version & Release Directive
 -- =============================================================================
+-- Release channels are enabled, so use REGISTER VERSION (not ADD VERSION).
+-- If the version already exists, add a patch instead.
+-- If the version is already in the channel, the ADD VERSION to channel will
+-- fail — that's fine, just skip it.
 
+-- Option A: First run (version doesn't exist yet)
+-- ALTER APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG
+--     REGISTER VERSION V1_0
+--     USING '@AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE';
+
+-- Option B: Subsequent runs (version exists, add a patch)
 ALTER APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG
-    ADD VERSION V1_0
+    ADD PATCH FOR VERSION V1_0
     USING '@AVEVA_CONNECT_APP_PKG.APP_SRC.STAGE';
 
+-- Add version to DEFAULT release channel (skip if already there)
+-- ALTER APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG
+--     MODIFY RELEASE CHANNEL DEFAULT ADD VERSION V1_0;
+
+-- Set the release directive (update patch number to match the patch just created)
 ALTER APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG
+    MODIFY RELEASE CHANNEL DEFAULT
     SET DEFAULT RELEASE DIRECTIVE
     VERSION = V1_0
     PATCH = 0;
@@ -168,6 +184,11 @@ SHOW VERSIONS IN APPLICATION PACKAGE AVEVA_CONNECT_APP_PKG;
 -- =============================================================================
 -- This is the proc from onboard_customer_e2e.sql.
 -- After this, onboarding is just: CALL AVEVA_CONNECT.ADMIN.ONBOARD_CUSTOMER(...)
+--
+-- Drop any old signatures first to avoid ambiguity errors on CREATE OR REPLACE.
+DROP PROCEDURE IF EXISTS AVEVA_CONNECT.ADMIN.ONBOARD_CUSTOMER(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+DROP PROCEDURE IF EXISTS AVEVA_CONNECT.ADMIN.ONBOARD_CUSTOMER(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+DROP PROCEDURE IF EXISTS AVEVA_CONNECT.ADMIN.ONBOARD_CUSTOMER(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
 
 CREATE OR REPLACE PROCEDURE AVEVA_CONNECT.ADMIN.ONBOARD_CUSTOMER(
     P_CUSTOMER_NAME    VARCHAR,
@@ -303,17 +324,34 @@ BEGIN
     END;
 
     -- STEP 2: Catalog Integration (Delta Sharing IRC)
+    -- Uses CREATE IF NOT EXISTS to avoid breaking active CLD tables that depend on it.
+    -- If the integration already exists, we ALTER it to update credentials.
     BEGIN
         v_sub_log := 'catalog_uri=' || :P_CATALOG_URI || ',warehouse_id=' || :P_WAREHOUSE_ID;
-        EXECUTE IMMEDIATE
-            'CREATE OR REPLACE CATALOG INTEGRATION ' || :v_catalog_int ||
-            ' CATALOG_SOURCE = ICEBERG_REST TABLE_FORMAT = ICEBERG' ||
-            ' REST_CONFIG = (CATALOG_URI = ''' || :P_CATALOG_URI ||
-            ''' WAREHOUSE = ''' || :P_WAREHOUSE_ID ||
-            ''' ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS)' ||
-            ' REST_AUTHENTICATION = (TYPE = BEARER BEARER_TOKEN = ''' || :P_BEARER_TOKEN ||
-            ''') ENABLED = TRUE REFRESH_INTERVAL_SECONDS = 30';
-        v_sub_log := v_sub_log || ',create_ok';
+        BEGIN
+            EXECUTE IMMEDIATE
+                'CREATE CATALOG INTEGRATION IF NOT EXISTS ' || :v_catalog_int ||
+                ' CATALOG_SOURCE = ICEBERG_REST TABLE_FORMAT = ICEBERG' ||
+                ' REST_CONFIG = (CATALOG_URI = ''' || :P_CATALOG_URI ||
+                ''' WAREHOUSE = ''' || :P_WAREHOUSE_ID ||
+                ''' ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS)' ||
+                ' REST_AUTHENTICATION = (TYPE = BEARER BEARER_TOKEN = ''' || :P_BEARER_TOKEN ||
+                ''') ENABLED = TRUE REFRESH_INTERVAL_SECONDS = 30';
+            v_sub_log := v_sub_log || ',create_ok';
+        EXCEPTION WHEN OTHER THEN
+            v_sub_err := SQLERRM;
+            v_sub_log := v_sub_log || ',create_err(' || :v_sub_err || ')';
+            -- Integration exists with active tables — update credentials via ALTER
+            BEGIN
+                EXECUTE IMMEDIATE
+                    'ALTER CATALOG INTEGRATION ' || :v_catalog_int ||
+                    ' SET REST_AUTHENTICATION = (TYPE = BEARER BEARER_TOKEN = ''' || :P_BEARER_TOKEN || ''')';
+                v_sub_log := v_sub_log || ',alter_token_ok';
+            EXCEPTION WHEN OTHER THEN
+                v_sub_err := SQLERRM;
+                v_sub_log := v_sub_log || ',alter_token_err(' || :v_sub_err || ')';
+            END;
+        END;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
             VALUES (:P_CUSTOMER_NAME, 2, 'Catalog Integration', 'SUCCESS', :v_catalog_int || ' | ' || :v_sub_log);
         v_steps_ok := v_steps_ok + 1;
@@ -573,13 +611,17 @@ BEGIN
     -- STEP 8: Register Customer (idempotent)
     BEGIN
         v_sub_log := '';
+        LET v_safe_bundled VARCHAR := REPLACE(:v_bundled_list, '''', '''''');
+        LET v_safe_not_bundled VARCHAR := REPLACE(:v_not_bundled_list, '''', '''''');
+        LET v_safe_cust VARCHAR := REPLACE(:P_CUSTOMER_NAME, '''', '''''');
+        LET v_safe_acct VARCHAR := REPLACE(:P_CUSTOMER_ACCOUNT, '''', '''''');
         EXECUTE IMMEDIATE
-            'INSERT INTO AVEVA_CONNECT.ADMIN.CUSTOMERS (CUSTOMER_NAME, SNOWFLAKE_ACCOUNT_ID, STATUS, NOTES, TABLES_BUNDLED, TABLES_NOT_BUNDLED)
-             SELECT ''' || :P_CUSTOMER_NAME || ''', ''' || :P_CUSTOMER_ACCOUNT || ''', ''ACTIVE'',
-                    ''Onboarded via proc. Distribution: ' || :v_dist_mode || '.'',
-                    ''' || REPLACE(:v_bundled_list, '''', '''''') || ''',
-                    ''' || REPLACE(:v_not_bundled_list, '''', '''''') || '''
-             WHERE NOT EXISTS (SELECT 1 FROM AVEVA_CONNECT.ADMIN.CUSTOMERS WHERE SNOWFLAKE_ACCOUNT_ID = ''' || :P_CUSTOMER_ACCOUNT || ''')';
+            'INSERT INTO AVEVA_CONNECT.ADMIN.CUSTOMERS (CUSTOMER_NAME, SNOWFLAKE_ACCOUNT_ID, STATUS, NOTES, TABLES_BUNDLED, TABLES_NOT_BUNDLED) ' ||
+            'SELECT ''' || :v_safe_cust || ''', ''' || :v_safe_acct || ''', ''ACTIVE'', ' ||
+            '''Onboarded via proc. Distribution: ' || :v_dist_mode || '.'',' ||
+            '''' || :v_safe_bundled || ''',' ||
+            '''' || :v_safe_not_bundled || '''' ||
+            ' WHERE NOT EXISTS (SELECT 1 FROM AVEVA_CONNECT.ADMIN.CUSTOMERS WHERE SNOWFLAKE_ACCOUNT_ID = ''' || :v_safe_acct || ''')';
         v_sub_log := 'customer_insert_ok';
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
             VALUES (:P_CUSTOMER_NAME, 8, 'Register Customer', 'SUCCESS', :v_sub_log || ',dist=' || :v_dist_mode);
