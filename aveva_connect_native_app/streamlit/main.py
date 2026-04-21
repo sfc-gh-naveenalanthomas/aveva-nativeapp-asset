@@ -453,6 +453,29 @@ if page == "Dashboard":
     c3.metric("Domains", len(domains))
     c4.metric("Signal Types", metadata_df["SIGNAL_NAME"].nunique() if not metadata_df.empty else 0)
 
+    # Data freshness indicator
+    try:
+        pfx = db_prefix()
+        view_names_for_fresh = metadata_df["STREAM_VIEW_NAME"].unique().tolist()[:5] if not metadata_df.empty else []
+        max_stale_hours = 0
+        for vn_f in view_names_for_fresh:
+            quoted_f = vn_f.replace('"', '""')
+            try:
+                fr_df = session.sql(
+                    f'SELECT DATEDIFF(\'hour\', MAX("Timestamp"), CURRENT_TIMESTAMP()) AS HOURS_STALE '
+                    f'FROM {pfx}PROXY_VIEWS."{quoted_f}"'
+                ).to_pandas()
+                if not fr_df.empty and pd.notna(fr_df["HOURS_STALE"].iloc[0]):
+                    max_stale_hours = max(max_stale_hours, int(fr_df["HOURS_STALE"].iloc[0]))
+            except Exception:
+                pass
+        if max_stale_hours > 48:
+            st.warning(f"Some data streams are {max_stale_hours // 24} days old. Contact your data provider for updates.")
+        elif max_stale_hours > 0:
+            st.caption(f"Data freshness: most recent data is {max_stale_hours}h old")
+    except Exception:
+        pass
+
     st.divider()
 
     for domain, count in sorted(domains.items(), key=lambda x: -x[1]):
@@ -482,7 +505,7 @@ if page == "Dashboard":
                         st.caption(f"Trend: {sample_asset} - {sample_signal}")
                         st.line_chart(chart_df.set_index("HOUR")["AVG_VALUE"])
                 except Exception:
-                    pass
+                    st.caption("Trend unavailable — data source temporarily unreachable")
 
     if st.button("Regenerate Dashboard"):
         st.cache_data.clear()

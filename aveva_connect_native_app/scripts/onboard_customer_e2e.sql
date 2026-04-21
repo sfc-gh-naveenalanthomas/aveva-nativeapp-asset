@@ -116,7 +116,8 @@ CREATE OR REPLACE PROCEDURE AVEVA_CONNECT.ADMIN.ONBOARD_CUSTOMER(
     P_BEARER_TOKEN     VARCHAR,                -- Databricks PAT or Delta Sharing recipient token
     P_WAREHOUSE_ID     VARCHAR,                -- Databricks warehouse/share ID
     P_REGION           VARCHAR DEFAULT NULL,   -- e.g. 'PUBLIC.AZURE_WESTUS2' (NULL = use config)
-    P_CLOUD            VARCHAR DEFAULT NULL    -- e.g. 'AZURE' (NULL = derived from region)
+    P_CLOUD            VARCHAR DEFAULT NULL,   -- e.g. 'AZURE' (NULL = derived from region)
+    P_FORCE_LISTING    BOOLEAN DEFAULT FALSE  -- TRUE = drop & recreate listing if it exists
 )
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -147,6 +148,8 @@ DECLARE
     -- Listing construction
     v_listing_yaml    VARCHAR;
     v_listing_sql     VARCHAR;
+    v_listing_exists  BOOLEAN DEFAULT FALSE;
+    v_listing_count   INTEGER DEFAULT 0;
 
     -- Tracking
     v_steps_ok        INTEGER DEFAULT 0;
@@ -156,7 +159,18 @@ DECLARE
     v_proxy_count     INTEGER DEFAULT 0;
     v_table_count     INTEGER DEFAULT 0;
     v_retry           INTEGER DEFAULT 0;
+    v_skipped         VARCHAR DEFAULT '';
 BEGIN
+
+    -- =========================================================================
+    -- Validate customer name (alphanumeric + underscores only)
+    -- =========================================================================
+    IF (NOT REGEXP_LIKE(:P_CUSTOMER_NAME, '^[A-Za-z0-9_]+$')) THEN
+        RETURN 'ERROR: CUSTOMER_NAME must contain only alphanumeric characters and underscores. Got: ' || :P_CUSTOMER_NAME;
+    END IF;
+    IF (LENGTH(:P_CUSTOMER_NAME) > 100 OR LENGTH(:P_CUSTOMER_NAME) < 1) THEN
+        RETURN 'ERROR: CUSTOMER_NAME must be 1-100 characters.';
+    END IF;
 
     -- =========================================================================
     -- Load defaults from ONBOARDING_CONFIG
@@ -372,18 +386,30 @@ BEGIN
             FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
         OPEN c1;
         v_proxy_count := 0;
+        v_skipped := '';
         FOR rec IN c1 DO
             BEGIN
                 EXECUTE IMMEDIATE 'CREATE OR REPLACE SECURE VIEW ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '" AS SELECT * FROM ' || :v_cld_db || '."' || rec.TABLE_SCHEMA || '"."' || rec.TABLE_NAME || '"';
-                EXECUTE IMMEDIATE 'GRANT SELECT ON VIEW ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '" TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
-                v_proxy_count := v_proxy_count + 1;
+                -- Validate: ensure underlying CLD table is reachable
+                BEGIN
+                    EXECUTE IMMEDIATE 'SELECT 1 FROM ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '" LIMIT 1';
+                    EXECUTE IMMEDIATE 'GRANT SELECT ON VIEW ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '" TO SHARE IN APPLICATION PACKAGE ' || :v_app_pkg;
+                    v_proxy_count := v_proxy_count + 1;
+                EXCEPTION WHEN OTHER THEN
+                    -- CLD table unreachable — drop the broken proxy view
+                    BEGIN
+                        EXECUTE IMMEDIATE 'DROP VIEW IF EXISTS ' || :v_app_pkg || '.PROXY_VIEWS."' || rec.TABLE_NAME || '"';
+                    EXCEPTION WHEN OTHER THEN NULL;
+                    END;
+                    v_skipped := v_skipped || rec.TABLE_NAME || ',';
+                END;
             EXCEPTION WHEN OTHER THEN NULL;
             END;
         END FOR;
         CLOSE c1;
 
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'SUCCESS', :v_proxy_count || ' proxy views created (waited ' || :v_retry * 10 || 's for CLD sync)');
+            VALUES (:P_CUSTOMER_NAME, 5, 'Proxy Views', 'SUCCESS', :v_proxy_count || ' proxy views created (waited ' || :v_retry * 10 || 's for CLD sync, skipped: ' || COALESCE(NULLIF(:v_skipped, ''), 'none') || ')');
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;
@@ -451,17 +477,46 @@ BEGIN
                 ' AS ''' || REPLACE(:v_listing_yaml, '''', '''''') || '''' ||
                 ' PUBLISH = FALSE REVIEW = FALSE';
         END IF;
+        -- Check if listing already exists
+        v_listing_exists := FALSE;
         BEGIN
-            EXECUTE IMMEDIATE :v_listing_sql;
-        EXCEPTION WHEN OTHER THEN NULL;
-        END;
-        BEGIN
-            EXECUTE IMMEDIATE 'ALTER LISTING ' || :v_listing_name || ' PUBLISH';
-        EXCEPTION WHEN OTHER THEN NULL;
+            EXECUTE IMMEDIATE 'SHOW LISTINGS LIKE ''' || :v_listing_name || '''';
+            SELECT COUNT(*) INTO :v_listing_count FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+            IF (:v_listing_count > 0) THEN
+                v_listing_exists := TRUE;
+            END IF;
+        EXCEPTION WHEN OTHER THEN
+            v_listing_exists := FALSE;
         END;
 
+        IF (:v_listing_exists AND :P_FORCE_LISTING) THEN
+            -- Drop and recreate with updated config
+            BEGIN
+                EXECUTE IMMEDIATE 'DROP LISTING IF EXISTS ' || :v_listing_name;
+            EXCEPTION WHEN OTHER THEN NULL;
+            END;
+            v_listing_exists := FALSE;
+        END IF;
+
+        IF (NOT :v_listing_exists) THEN
+            BEGIN
+                EXECUTE IMMEDIATE :v_listing_sql;
+            EXCEPTION WHEN OTHER THEN NULL;
+            END;
+            BEGIN
+                EXECUTE IMMEDIATE 'ALTER LISTING ' || :v_listing_name || ' PUBLISH';
+            EXCEPTION WHEN OTHER THEN NULL;
+            END;
+        END IF;
+
+        LET v_listing_msg VARCHAR := '';
+        IF (:v_listing_exists) THEN
+            v_listing_msg := 'Skipped (already exists): ' || :v_listing_name || ' (region=' || :v_region || ', cloud=' || :v_cloud || ', force=' || :P_FORCE_LISTING::VARCHAR || ')';
+        ELSE
+            v_listing_msg := 'Published: ' || :v_listing_name || ' (region=' || :v_region || ', cloud=' || :v_cloud || ', force=' || :P_FORCE_LISTING::VARCHAR || ')';
+        END IF;
         INSERT INTO AVEVA_CONNECT.ADMIN.ONBOARDING_LOG (CUSTOMER_NAME, STEP_NUMBER, STEP_NAME, STATUS, MESSAGE)
-            VALUES (:P_CUSTOMER_NAME, 6, 'Listing', 'SUCCESS', 'Published: ' || :v_listing_name || ' (region=' || :v_region || ', cloud=' || :v_cloud || ')');
+            VALUES (:P_CUSTOMER_NAME, 6, 'Listing', 'SUCCESS', :v_listing_msg);
         v_steps_ok := v_steps_ok + 1;
     EXCEPTION WHEN OTHER THEN
         v_err := SQLERRM;

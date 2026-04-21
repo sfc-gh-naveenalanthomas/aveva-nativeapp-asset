@@ -113,18 +113,6 @@ CREATE TABLE IF NOT EXISTS CONFIG.ANOMALY_SHARE_BACK (
 GRANT SELECT, INSERT, DELETE ON TABLE CONFIG.ANOMALY_SHARE_BACK TO APPLICATION ROLE APP_PUBLIC;
 
 -- =====================================================
--- Init Lock (idempotency / concurrency guard)
--- =====================================================
-
-CREATE TABLE IF NOT EXISTS CONFIG.INIT_LOCK (
-    LOCK_ID VARCHAR PRIMARY KEY,
-    ACQUIRED_AT TIMESTAMP_LTZ,
-    ACQUIRED_BY VARCHAR
-);
-
-GRANT SELECT, INSERT, DELETE ON TABLE CONFIG.INIT_LOCK TO APPLICATION ROLE APP_PUBLIC;
-
--- =====================================================
 -- Init Progress (step tracking for Streamlit UI)
 -- =====================================================
 
@@ -207,11 +195,10 @@ import json
 
 def run(session):
     try:
-        # Acquire init lock
-        existing = session.sql("SELECT LOCK_ID FROM CONFIG.INIT_LOCK WHERE LOCK_ID = 'INIT'").collect()
-        if len(existing) > 0:
-            return json.dumps({"status": "ERROR", "message": "Initialization already in progress", "details": {}})
-        session.sql("INSERT INTO CONFIG.INIT_LOCK (LOCK_ID, ACQUIRED_AT, ACQUIRED_BY) SELECT 'INIT', CURRENT_TIMESTAMP(), CURRENT_USER()").collect()
+        # Check if already initialized (skip if so — use REINITIALIZE to force)
+        init_check = session.sql("SELECT VALUE FROM CONFIG.APP_STATE WHERE KEY = 'VIEWS_INITIALIZED'").collect()
+        if len(init_check) > 0 and init_check[0]["VALUE"] == 'TRUE':
+            return json.dumps({"status": "SUCCESS", "message": "Already initialized — use REINITIALIZE to re-run", "details": {"skipped": True}})
 
         # Track progress
         session.sql("MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'INITIALIZE_VIEWS' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='RUNNING', STARTED_AT=CURRENT_TIMESTAMP(), COMPLETED_AT=NULL, DETAILS=NULL WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, STARTED_AT) VALUES (S.STEP_NAME, 'RUNNING', CURRENT_TIMESTAMP())").collect()
@@ -241,9 +228,6 @@ def run(session):
         detail = f"{view_count} proxy views discovered for account {current_account}"
         session.sql(f"UPDATE CONFIG.INIT_PROGRESS SET STATUS='COMPLETE', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='{detail}' WHERE STEP_NAME='INITIALIZE_VIEWS'").collect()
 
-        # Release lock
-        session.sql("DELETE FROM CONFIG.INIT_LOCK WHERE LOCK_ID = 'INIT'").collect()
-
         return json.dumps({
             "status": "SUCCESS",
             "message": f"Discovered {view_count} proxy views",
@@ -254,11 +238,6 @@ def run(session):
         })
 
     except Exception as e:
-        # Release lock on error
-        try:
-            session.sql("DELETE FROM CONFIG.INIT_LOCK WHERE LOCK_ID = 'INIT'").collect()
-        except:
-            pass
         session.sql("MERGE INTO CONFIG.INIT_PROGRESS T USING (SELECT 'INITIALIZE_VIEWS' AS STEP_NAME) S ON T.STEP_NAME = S.STEP_NAME WHEN MATCHED THEN UPDATE SET STATUS='ERROR', COMPLETED_AT=CURRENT_TIMESTAMP(), DETAILS='" + str(e).replace("'", "''") + "' WHEN NOT MATCHED THEN INSERT (STEP_NAME, STATUS, COMPLETED_AT, DETAILS) VALUES (S.STEP_NAME, 'ERROR', CURRENT_TIMESTAMP(), '" + str(e).replace("'", "''") + "')").collect()
         return json.dumps({"status": "ERROR", "message": str(e), "details": {}})
 $$;
@@ -340,6 +319,13 @@ def run(session):
                 continue
 
             col_names = set(cr["name"] for cr in col_rows)
+
+            # Validate view is queryable (catches broken CLD references)
+            try:
+                session.sql(f'SELECT 1 FROM PROXY_VIEWS."{quoted}" LIMIT 1').collect()
+            except:
+                continue  # Skip unreachable views
+
             has_field = "Field" in col_names
             has_value = "Value" in col_names
 
@@ -389,6 +375,16 @@ def run(session):
                         "view": view_name, "stream": cn,
                         "asset": asset_name, "signal": signal_name, "dtype": data_type
                     })
+
+        # Deduplicate: keep first occurrence per (asset, signal)
+        seen = set()
+        unique_records = []
+        for rec in stream_records:
+            key = (rec["asset"], rec["signal"])
+            if key not in seen:
+                seen.add(key)
+                unique_records.append(rec)
+        stream_records = unique_records
 
         # Insert metadata with keyword-classified domains
         for rec in stream_records:
@@ -880,7 +876,6 @@ def run(session):
         session.sql("DELETE FROM CONFIG.STREAM_METADATA").collect()
         session.sql("DELETE FROM CONFIG.ASSET_HIERARCHY").collect()
         session.sql("DELETE FROM CONFIG.INIT_PROGRESS").collect()
-        session.sql("DELETE FROM CONFIG.INIT_LOCK").collect()
 
         # Drop existing views in DATA_VIEWS (except system ones we'll recreate)
         try:
@@ -987,24 +982,28 @@ def run(session):
     except Exception as e:
         checks["stream_metadata"] = {"status": "ERROR", "error": str(e)}
 
-    # 4. Proxy views exist and at least one queryable view works
+    # 4. Proxy views — count total vs queryable
     try:
         pv_rows = session.sql("SHOW VIEWS IN SCHEMA PROXY_VIEWS").collect()
         pv_count = len(pv_rows)
         if pv_count > 0:
-            # Spot-check a view that has metadata (proven queryable)
-            queryable_check = False
-            meta_views = session.sql("SELECT DISTINCT STREAM_VIEW_NAME FROM CONFIG.STREAM_METADATA LIMIT 1").collect()
-            if meta_views:
-                test_view = meta_views[0]["STREAM_VIEW_NAME"].replace('"', '""')
+            queryable_count = 0
+            unreachable = []
+            for pv in pv_rows:
+                vn = pv["name"].replace('"', '""')
                 try:
-                    session.sql(f'SELECT 1 FROM PROXY_VIEWS."{test_view}" LIMIT 1').collect()
-                    queryable_check = True
+                    session.sql(f'SELECT 1 FROM PROXY_VIEWS."{vn}" LIMIT 1').collect()
+                    queryable_count += 1
                 except:
-                    pass
-            checks["proxy_views"] = {"status": "OK" if queryable_check else "DEGRADED", "count": pv_count}
+                    unreachable.append(pv["name"])
+            if queryable_count == pv_count:
+                checks["proxy_views"] = {"status": "OK", "total": pv_count, "queryable": queryable_count}
+            elif queryable_count > 0:
+                checks["proxy_views"] = {"status": "DEGRADED", "total": pv_count, "queryable": queryable_count, "unreachable": unreachable}
+            else:
+                checks["proxy_views"] = {"status": "ERROR", "total": pv_count, "queryable": 0, "unreachable": unreachable}
         else:
-            checks["proxy_views"] = {"status": "EMPTY", "count": 0}
+            checks["proxy_views"] = {"status": "EMPTY", "total": 0, "queryable": 0}
     except Exception as e:
         checks["proxy_views"] = {"status": "ERROR", "error": str(e)}
 
@@ -1023,7 +1022,36 @@ def run(session):
         except:
             checks["semantic_view"] = {"status": "ERROR", "error": str(e)}
 
-    all_ok = all(c.get("status") in ("OK", "SKIPPED") for c in checks.values())
+    # 6. Data freshness
+    try:
+        meta_views = session.sql("SELECT DISTINCT STREAM_VIEW_NAME FROM CONFIG.STREAM_METADATA").collect()
+        freshness = {}
+        stale_count = 0
+        for mv in meta_views[:10]:
+            vn = mv["STREAM_VIEW_NAME"].replace('"', '""')
+            try:
+                fr = session.sql(f'SELECT MAX("Timestamp") AS LATEST FROM PROXY_VIEWS."{vn}"').collect()
+                if fr and fr[0]["LATEST"]:
+                    latest = fr[0]["LATEST"]
+                    hours_ago = session.sql(f"SELECT DATEDIFF('hour', '{latest}'::TIMESTAMP_LTZ, CURRENT_TIMESTAMP())").collect()
+                    hours = int(hours_ago[0][0]) if hours_ago else -1
+                    freshness[mv["STREAM_VIEW_NAME"]] = {"latest": str(latest), "hours_stale": hours}
+                    if hours > 48:
+                        stale_count += 1
+                else:
+                    freshness[mv["STREAM_VIEW_NAME"]] = {"latest": None, "hours_stale": -1}
+            except:
+                freshness[mv["STREAM_VIEW_NAME"]] = {"latest": "ERROR", "hours_stale": -1}
+        checks["data_freshness"] = {
+            "status": "OK" if stale_count == 0 else "STALE",
+            "stale_views": stale_count,
+            "total_views": len(meta_views),
+            "details": freshness
+        }
+    except Exception as e:
+        checks["data_freshness"] = {"status": "ERROR", "error": str(e)}
+
+    all_ok = all(c.get("status") in ("OK", "SKIPPED", "STALE") for c in checks.values())
     return json.dumps({
         "status": "HEALTHY" if all_ok else "DEGRADED",
         "message": "All checks passed" if all_ok else "Some checks failed",
@@ -1083,9 +1111,9 @@ def run(session):
         else:
             overall = "NOT_STARTED"
 
-        # Check lock
-        lock_rows = session.sql("SELECT LOCK_ID, ACQUIRED_AT, ACQUIRED_BY FROM CONFIG.INIT_LOCK").collect()
-        locked = len(lock_rows) > 0
+        # Check if any step is currently running
+        running_rows = session.sql("SELECT STEP_NAME FROM CONFIG.INIT_PROGRESS WHERE STATUS = 'RUNNING'").collect()
+        locked = len(running_rows) > 0
 
         return json.dumps({
             "status": overall,
@@ -1149,12 +1177,13 @@ def _resolve_signal(session, asset_name, signal_name):
 
     if has_field:
         safe_stream = stream_name.replace("'", "''")
-        return (view_fqn, '"Timestamp"', '"Value"::DOUBLE',
-                f"\"Field\" = '{safe_stream}' AND \"Value\" IS NOT NULL")
+        return (view_fqn, '"Timestamp"', 'TRY_CAST("Value" AS DOUBLE)',
+                "\"Field\" = '" + safe_stream + "' AND \"Value\" IS NOT NULL")
     else:
         safe_col = stream_name.replace('"', '""')
-        return (view_fqn, '"Timestamp"', f'"{safe_col}"::DOUBLE',
-                f'"{safe_col}" IS NOT NULL')
+        col_ref = '"' + safe_col + '"'
+        return (view_fqn, '"Timestamp"', 'TRY_CAST(' + col_ref + ' AS DOUBLE)',
+                col_ref + ' IS NOT NULL')
 
 def run(session, p_asset_name, p_signal_name, p_lookback_days):
     try:
@@ -1334,12 +1363,13 @@ def _resolve_signal(session, asset_name, signal_name):
 
     if has_field:
         safe_stream = stream_name.replace("'", "''")
-        return (view_fqn, '"Timestamp"', '"Value"::DOUBLE',
-                f"\"Field\" = '{safe_stream}' AND \"Value\" IS NOT NULL")
+        return (view_fqn, '"Timestamp"', 'TRY_CAST("Value" AS DOUBLE)',
+                "\"Field\" = '" + safe_stream + "' AND \"Value\" IS NOT NULL")
     else:
         safe_col = stream_name.replace('"', '""')
-        return (view_fqn, '"Timestamp"', f'"{safe_col}"::DOUBLE',
-                f'"{safe_col}" IS NOT NULL')
+        col_ref = '"' + safe_col + '"'
+        return (view_fqn, '"Timestamp"', 'TRY_CAST(' + col_ref + ' AS DOUBLE)',
+                col_ref + ' IS NOT NULL')
 
 def run(session, p_asset_name, p_signal_name, p_horizon_days):
     try:
@@ -1358,16 +1388,15 @@ def run(session, p_asset_name, p_signal_name, p_horizon_days):
             p_signal_name = auto[0]["SIGNAL_NAME"]
 
         view_fqn, ts_col, value_expr, where_filter = _resolve_signal(session, p_asset_name, p_signal_name)
+        safe_asset = p_asset_name.replace("'", "''")
+        safe_signal = p_signal_name.replace("'", "''")
 
         # Count available data and determine frequency
-        stats = session.sql(f"""
-            SELECT COUNT(*) AS CNT,
-                   MIN({ts_col}) AS MIN_TS, MAX({ts_col}) AS MAX_TS,
-                   AVG({value_expr}) AS AVG_VAL,
-                   STDDEV({value_expr}) AS STD_VAL
-            FROM {view_fqn}
-            WHERE {where_filter}
-        """).collect()
+        stats = session.sql(
+            "SELECT COUNT(*) AS CNT, MIN(" + ts_col + ") AS MIN_TS, MAX(" + ts_col + ") AS MAX_TS, "
+            "AVG(" + value_expr + ") AS AVG_VAL, STDDEV(" + value_expr + ") AS STD_VAL "
+            "FROM " + view_fqn + " WHERE " + where_filter
+        ).collect()
         data_count = stats[0]["CNT"] if len(stats) > 0 else 0
         if data_count < 12:
             return json.dumps({
@@ -1379,27 +1408,27 @@ def run(session, p_asset_name, p_signal_name, p_horizon_days):
         std_val = float(stats[0]["STD_VAL"]) if stats[0]["STD_VAL"] else 1
 
         # Determine data frequency
-        freq_rows = session.sql(f"""
-            SELECT MEDIAN(INTERVAL_MIN) AS MED_INTERVAL FROM (
-                SELECT TIMESTAMPDIFF('minute', LAG({ts_col}) OVER (ORDER BY {ts_col}), {ts_col}) AS INTERVAL_MIN
-                FROM {view_fqn}
-                WHERE {where_filter}
-                ORDER BY {ts_col} DESC LIMIT 200
-            ) WHERE INTERVAL_MIN > 0
-        """).collect()
+        try:
+            freq_rows = session.sql(
+                "SELECT MEDIAN(INTERVAL_MIN) AS MED_INTERVAL FROM ("
+                " SELECT TIMESTAMPDIFF('minute', LAG(" + ts_col + ") OVER (ORDER BY " + ts_col + "), " + ts_col + ") AS INTERVAL_MIN"
+                " FROM " + view_fqn + " WHERE " + where_filter +
+                " ORDER BY " + ts_col + " DESC LIMIT 200"
+                ") WHERE INTERVAL_MIN > 0"
+            ).collect()
+        except Exception as freq_err:
+            return json.dumps({"status": "ERROR", "message": f"Frequency query failed: {freq_err}", "details": {"view_fqn": view_fqn, "ts_col": ts_col, "where_filter": where_filter}})
         avg_interval_min = float(freq_rows[0]["MED_INTERVAL"]) if freq_rows and freq_rows[0]["MED_INTERVAL"] else 60
         steps_per_day = max(int(1440 / avg_interval_min), 1)
         forecast_steps = min(steps_per_day * horizon, 5000)
 
         # Fetch last 200 data points for training (ordered chronologically)
-        training_rows = session.sql(f"""
-            SELECT {ts_col} AS TS, {value_expr} AS VALUE FROM (
-                SELECT {ts_col}, {value_expr}, ROW_NUMBER() OVER (ORDER BY {ts_col} DESC) AS RN
-                FROM {view_fqn}
-                WHERE {where_filter}
-            ) WHERE RN <= 200
-            ORDER BY TS ASC
-        """).collect()
+        training_rows = session.sql(
+            "SELECT TS, VALUE FROM ("
+            " SELECT " + ts_col + " AS TS, " + value_expr + " AS VALUE, ROW_NUMBER() OVER (ORDER BY " + ts_col + " DESC) AS RN"
+            " FROM " + view_fqn + " WHERE " + where_filter +
+            ") WHERE RN <= 200 ORDER BY TS ASC"
+        ).collect()
 
         if len(training_rows) < 5:
             return json.dumps({
